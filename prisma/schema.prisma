@@ -1,0 +1,222 @@
+// PayFlow — Prisma schema
+//
+// Multi-tenant model: `User` is a tenant (business owner) who connects their
+// own Stripe account via Stripe Connect (Standard accounts). `Customer` is
+// that tenant's own end customer, never a platform-level concept.
+//
+// Partitioning note (see docs/adr, "partition-ready schema"): `Transaction`
+// is the highest-volume table and is designed to eventually be physically
+// partitioned with `PARTITION BY RANGE (createdAt)`. We are NOT doing that
+// yet (no real data volume justifies it). If/when we do, Postgres requires
+// the partition key to be part of every unique constraint, which means the
+// primary key would need to become composite (id, createdAt) at that point
+// — noted here so it isn't a surprise during that migration.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Connection URL lives in prisma.config.ts (Prisma 7 no longer allows
+// datasource.url in the schema itself), consumed there via a driver
+// adapter — see src/lib/prisma.ts for the PrismaClient side of this.
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id    String  @id @default(cuid())
+  email String  @unique
+  name  String?
+
+  // Credentials auth (Auth.js, JWT sessions — see src/lib/auth.ts). Null is
+  // possible in principle for a future OAuth-only sign-in method; today
+  // every User has one since Credentials is the only provider.
+  hashedPassword String?
+
+  // Stripe Connect (Standard account). Both are null until the tenant starts
+  // onboarding; onboardingComplete flips to true only once Stripe confirms
+  // the account can accept charges (see account.updated handling, ADR-003).
+  stripeAccountId    String? @unique
+  onboardingComplete Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  customers     Customer[]
+  transactions  Transaction[]
+  webhookEvents WebhookEvent[]
+  revenueStats  MaterializedRevenueStats?
+
+  @@index([stripeAccountId])
+}
+
+model Customer {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Stripe Customer object id, scoped to the tenant's connected account.
+  stripeCustomerId String? @unique
+  email            String
+  name             String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  invoices      Invoice[]
+  subscriptions Subscription[]
+
+  @@index([userId, email])
+}
+
+enum InvoiceStatus {
+  PENDING
+  PAID
+  FAILED
+  VOID
+}
+
+model Invoice {
+  id         String   @id @default(cuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  stripeInvoiceId         String? @unique
+  stripeCheckoutSessionId String? @unique
+
+  status    InvoiceStatus @default(PENDING)
+  amountDue Int // cents
+  currency  String        @default("usd")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  transactions Transaction[]
+
+  // Real query pattern: "this tenant's invoices in status X", scoped through
+  // the customer. Composite over separate indexes because Postgres serves
+  // "WHERE customerId = ? AND status = ?" from one btree scan instead of
+  // intersecting two.
+  @@index([customerId, status])
+}
+
+enum SubscriptionStatus {
+  INCOMPLETE
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  UNPAID
+}
+
+model Subscription {
+  id         String   @id @default(cuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  stripeSubscriptionId String             @unique
+  status               SubscriptionStatus @default(INCOMPLETE)
+  currentPeriodEnd     DateTime?
+
+  // Stripe's `event.created` timestamp of the last lifecycle event actually
+  // applied to this row. BullMQ does not guarantee processing order across
+  // concurrent jobs, so the worker compares an incoming event's timestamp
+  // against this before writing — stale (out-of-order) events are discarded
+  // instead of applied. Last-write-wins by event time, not processing time.
+  lastEventAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([customerId])
+}
+
+model Transaction {
+  id     String @id @default(cuid())
+  // Denormalized tenant id (rather than requiring a join through Invoice ->
+  // Customer -> User) because the dominant query is "this tenant's
+  // transaction history", and that must stay fast as this table grows.
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  invoiceId String?
+  invoice   Invoice? @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+
+  // Originating Stripe event, kept for traceability/correlation — not a
+  // uniqueness/idempotency guard by itself (that's WebhookEvent.stripeEventId).
+  stripeEventId String?
+
+  // Free-form Stripe event type (e.g. "charge.succeeded", "charge.refunded")
+  // rather than a rigid enum: Stripe adds event types over time and we don't
+  // want a migration every time we start handling a new one.
+  type String
+
+  amount   Int // cents; positive = inflow, negative = refund/reversal
+  currency String @default("usd")
+
+  createdAt DateTime @default(now())
+
+  // The actual query this serves: paginate a tenant's transaction history by
+  // recency ("WHERE userId = ? ORDER BY createdAt DESC LIMIT ?"). One
+  // composite (userId, createdAt) index serves that in a single index scan;
+  // two single-column indexes would force Postgres to intersect bitmaps
+  // instead, which loses to the composite past a small row count.
+  @@index([userId, createdAt])
+}
+
+enum WebhookEventStatus {
+  RECEIVED // outbox row inserted, BullMQ job enqueued in the same transaction
+  PROCESSING
+  PROCESSED
+  FAILED
+}
+
+model WebhookEvent {
+  id String @id @default(cuid())
+
+  // Stripe's event.id — the inbound idempotency guard. Globally unique
+  // across the platform and every connected account.
+  stripeEventId String @unique
+
+  // Present for events from the Connect webhook endpoint (payment-relevant,
+  // tagged with an `account` field in the Stripe payload). Null for
+  // platform-endpoint events, which in this project is just
+  // `account.updated`.
+  stripeAccountId String?
+
+  // Resolved tenant. Nullable because resolution can fail (unrecognized
+  // account) — we still persist the raw event for audit/debugging rather
+  // than silently dropping it.
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  type    String // Stripe event type, e.g. "checkout.session.completed"
+  payload Json // raw event payload, for replay/debugging
+
+  // account.updated (platform endpoint) is NOT a payment event: it is
+  // handled synchronously in the request handler, no outbox/queue involved
+  // — there is nothing to lose by processing it inline, and doing so avoids
+  // a queue hop for a plain status-flag flip. Everything from the Connect
+  // endpoint goes through the outbox + BullMQ pipeline. See ADR-003.
+  status WebhookEventStatus @default(RECEIVED)
+
+  receivedAt  DateTime  @default(now())
+  processedAt DateTime?
+
+  @@index([userId, receivedAt])
+  @@index([status])
+}
+
+model MaterializedRevenueStats {
+  // Read model for the analytics dashboard (simplified CQRS: Transaction is
+  // the write model, this is the read model). One row per tenant, updated
+  // asynchronously by the worker after each processed transaction, and
+  // cached in Redis with TTL + explicit invalidation on top of this table.
+  userId String @id
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  mrr          Int   @default(0) // cents
+  churnRate    Float @default(0)
+  totalRevenue Int   @default(0) // cents, lifetime
+
+  updatedAt DateTime @updatedAt
+}

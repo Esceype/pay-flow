@@ -1,0 +1,12 @@
+FROM node:22-alpine
+WORKDIR /app
+COPY package.json package-lock.json ./
+COPY prisma ./prisma
+# devDependencies are kept (no --omit=dev): the worker runs TypeScript
+# directly via tsx rather than a separate compile step — see README for the
+# tradeoff and the deferred tsc+tsc-alias optimization.
+RUN npm ci
+COPY tsconfig.json ./
+COPY src ./src
+EXPOSE 3001
+CMD ["npx", "tsx", "src/worker/index.ts"]

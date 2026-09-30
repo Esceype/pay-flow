@@ -6,21 +6,41 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "worker:dev": "tsx watch src/worker/index.ts",
+    "worker:start": "tsx src/worker/index.ts",
+    "postinstall": "prisma generate"
   },
   "dependencies": {
+    "@bull-board/api": "^8.6.0",
+    "@bull-board/express": "^8.6.0",
+    "@prisma/adapter-pg": "^7.9.1",
+    "@prisma/client": "^7.9.1",
+    "bullmq": "^6.0.9",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "express-basic-auth": "^1.2.1",
+    "ioredis": "^6.0.0",
     "next": "16.3.0",
+    "next-auth": "^5.0.0-beta.32",
+    "pg": "^8.23.0",
     "react": "19.2.8",
-    "react-dom": "19.2.8"
+    "react-dom": "19.2.8",
+    "stripe": "^22.4.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
+    "@types/express": "^5.0.6",
     "@types/node": "^20",
+    "@types/pg": "^8.21.0",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.3.0",
+    "prisma": "^7.9.1",
     "tailwindcss": "^4",
+    "tsx": "^4.23.11",
     "typescript": "^5"
   }
 }

@@ -32,6 +32,8 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+# The documented template is meant to be committed — only real env files stay out.
+!.env.example
 
 # vercel
 .vercel
@@ -39,3 +41,8 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# locally installed agent skills (third-party, reinstallable) — not project code
+/.agents/
+/.claude/skills/
+/skills-lock.json
