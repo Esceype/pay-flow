@@ -1,0 +1,89 @@
+import { redirect } from "next/navigation";
+import { auth } from "@/lib/auth";
+import { prisma } from "@/lib/prisma";
+
+const CONNECT_ERROR_MESSAGES: Record<string, string> = {
+  access_denied: "You declined to connect your Stripe account.",
+  invalid_state: "That connection attempt expired or was invalid — please try again.",
+  token_exchange_failed: "Stripe couldn't confirm the connection — please try again.",
+  missing_account_id: "Stripe didn't return an account id — please try again.",
+  account_already_linked: "That Stripe account is already linked to a different user.",
+};
+
+export default async function DashboardPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ connect_error?: string }>;
+}) {
+  // Defense in depth: DashboardLayout already checks the session, but this
+  // page checks it directly too (docs/adr/004-auth-and-proxy-gate.md).
+  const session = await auth();
+  if (!session?.user) {
+    redirect("/login");
+  }
+
+  const params = await searchParams;
+  const user = await prisma.user.findUniqueOrThrow({
+    where: { id: session.user.id },
+    select: { email: true, stripeAccountId: true, onboardingComplete: true },
+  });
+
+  const connectError = params.connect_error
+    ? (CONNECT_ERROR_MESSAGES[params.connect_error] ?? "Something went wrong connecting Stripe.")
+    : null;
+
+  return (
+    <main className="flex flex-col gap-6">
+      <h1 className="text-2xl font-semibold">Dashboard</h1>
+      <p className="text-sm text-neutral-600">Signed in as {user.email}</p>
+
+      {connectError && (
+        <p role="alert" className="rounded bg-red-50 px-3 py-2 text-sm text-red-700">
+          {connectError}
+        </p>
+      )}
+
+      <section className="rounded border p-4">
+        <h2 className="font-medium">Stripe Connect</h2>
+        {user.onboardingComplete ? (
+          <p className="mt-2 text-sm text-green-700">
+            ✅ Connected ({user.stripeAccountId}). Charges and onboarding are complete.
+          </p>
+        ) : user.stripeAccountId ? (
+          <div className="mt-2 flex flex-col gap-2">
+            <p className="text-sm text-amber-700">
+              Account {user.stripeAccountId} is linked, but Stripe hasn&apos;t confirmed
+              onboarding is complete yet (details submission and/or charge capability
+              pending).
+            </p>
+            <a
+              href="/api/connect/start"
+              className="w-fit rounded bg-black px-3 py-2 text-sm text-white hover:bg-neutral-800"
+            >
+              Finish Stripe onboarding
+            </a>
+          </div>
+        ) : (
+          <div className="mt-2 flex flex-col gap-2">
+            <p className="text-sm text-neutral-600">
+              Connect your Stripe account to start accepting payments.
+            </p>
+            <a
+              href="/api/connect/start"
+              className="w-fit rounded bg-black px-3 py-2 text-sm text-white hover:bg-neutral-800"
+            >
+              Connect Stripe
+            </a>
+          </div>
+        )}
+      </section>
+
+      {user.onboardingComplete && (
+        <p className="text-sm text-neutral-600">
+          Head to <a href="/dashboard/customers" className="underline">Customers</a> to add a
+          customer and create your first invoice.
+        </p>
+      )}
+    </main>
+  );
+}
