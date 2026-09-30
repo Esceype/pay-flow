@@ -1,5 +1,11 @@
 # ADR-003: Stripe Connect multi-tenancy, and why `account.updated` bypasses the outbox
 
+> **Status: amended (2026-09-30).** The two-endpoint split and the
+> synchronous `account.updated` handler described below were built on a
+> wrong assumption about Stripe's event scopes. See
+> [Amendment](#amendment-2026-09-30-accountupdated-is-connected-accounts-scoped)
+> at the end — the original text is kept as the record of the decision.
+
 ## Context
 
 PayFlow is a platform, not a single-business billing tool: each `User` (tenant)
@@ -85,3 +91,55 @@ We chose **B**, because:
   `stripeAccountId`s (e.g. a webhook arriving before onboarding is
   reflected in our DB) rather than silently dropping them — see
   `prisma/schema.prisma`.
+
+## Amendment (2026-09-30): `account.updated` is Connected-accounts scoped
+
+### What was wrong
+
+Stripe assigns every webhook endpoint one of two scopes — **Your account**
+(`connect: false`) or **Connected accounts** (`connect: true`) — and
+delivers each event to the endpoints of *its* scope. For a connected
+account, `account.updated` is a **Connected accounts** event, as is
+`account.application.deauthorized`
+([Stripe docs: Connect webhooks](https://docs.stripe.com/connect/webhooks)).
+So the "platform endpoint" above would never have received the
+`account.updated` events it was built for in production. They would have
+arrived on the Connect endpoint instead, been queued, found no processor,
+and been marked `PROCESSED` — `onboardingComplete` would only ever have been
+set once, by the OAuth callback, and never updated afterwards (Stripe
+disabling charges, onboarding finished later, ...).
+
+Local testing didn't catch it: `stripe trigger account.updated` without
+`--stripe-account` fires the event on the **platform's own** account, which
+*is* Your-account scoped, so it did reach the platform endpoint. Connected
+account events need `stripe listen --forward-connect-to` and
+`stripe trigger --stripe-account acct_...`.
+
+### Decision
+
+- **One webhook endpoint** (`/api/webhooks/stripe-connect`, Connected
+  accounts scope). The platform endpoint and `STRIPE_WEBHOOK_SECRET` are
+  removed — PayFlow consumes no Your-account events. If it ever needs one
+  (e.g. `application_fee.*` for platform-revenue reporting), a
+  Your-account endpoint gets added back for that.
+- **`account.updated` goes through the outbox + BullMQ pipeline** like
+  every other event, handled by a worker processor
+  (`src/worker/processors/account.ts`). This reverses the "handle it
+  synchronously" choice above, but its reasoning mostly carries over: it
+  still isn't a payment event. What tips it is that it now arrives on the
+  outbox endpoint anyway — a synchronous special case inside that route
+  would mix two processing models in one handler, while the queue gives it
+  retries and an audit trail for free.
+- **Ordering needs no guard for `account.updated`**: the processor ignores
+  the payload and re-reads the account from Stripe
+  (`syncConnectAccountStatus`), so whichever job runs last writes the
+  current state. It also skips the API call entirely for an account no
+  longer linked to any user.
+- **`account.application.deauthorized` is now handled** — the tenant
+  disconnected PayFlow from their Stripe account, so the link is removed
+  and business actions are gated again. This one *does* need an ordering
+  guard: a deauthorization still queued after the tenant has already
+  reconnected must not wipe the new link. `User.stripeConnectedAt` is set
+  by the OAuth callback, and only a deauthorization whose `event.created`
+  is later than it may unlink (`unlinkConnectAccount`).
+

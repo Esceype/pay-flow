@@ -45,7 +45,7 @@ that gap were considered:
 
 - **A — a separate outbox-relay process** that polls Postgres for
   `WebhookEvent` rows stuck in `RECEIVED` past some threshold and re-enqueues
-  them. This is the textbook fix and is Phase 4/6 scope ("graceful
+  them. This is the textbook fix and is Phase 6 scope ("graceful
   degradation if Redis unavailable" is already on that phase's checklist)
   — it's a real piece of infrastructure, not a few lines.
 - **B — let the enqueue failure surface as a non-200 response**, so Stripe's
@@ -60,7 +60,7 @@ Redis hiccup) by piggybacking on infrastructure Stripe already provides
 (webhook retries with backoff, for up to three days). It does **not** cover
 Redis being down for longer than Stripe keeps retrying, or the platform
 being unreachable during Stripe's retry window entirely — that residual risk
-is accepted for now and is exactly what Phase 4/6's relay process is for.
+is accepted for now and is exactly what Phase 6's relay process is for.
 This tradeoff is worth re-examining before this pipeline handles anything
 where "up to a few days of retries" isn't an acceptable recovery window.
 
@@ -80,4 +80,4 @@ where "up to a few days of retries" isn't an acceptable recovery window.
   Worker's `failed` event listener (`src/worker/index.ts`) — visible both in
   Bull Board (which already surfaces failed jobs since
   `removeOnFail: false`) and by querying `WebhookEvent` directly. A proper
-  dead-letter UI beyond that is still Phase 4/6 scope.
+  dead-letter UI beyond that is still Phase 6 scope.

@@ -1,4 +1,9 @@
 # PayFlow — Senior-Level Architecture Plan
+
+> **Примітка (2026-09-30):** це початковий план. Нумерація фаз і деякі
+> деталі з того часу змінились — актуальний порядок фаз див. у `CLAUDE.md`
+> (Build Order), рішення — у `docs/adr/`. Зокрема, «платформний endpoint для
+> `account.updated`» виявився хибним припущенням: див. поправку до ADR-003.
 ## Stripe Subscription & Invoicing SaaS (multi-tenant, Stripe Connect), спроєктований як data-intensive система
 
 Ціль цього плану: не просто "інтегрував Stripe", а показати мислення інженера, який

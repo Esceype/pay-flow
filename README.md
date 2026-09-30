@@ -8,14 +8,13 @@ Architecture rationale and phased build plan:
 [`stripe-saas-senior-architecture-plan.md`](./stripe-saas-senior-architecture-plan.md).
 Individual decisions are recorded in [`docs/adr/`](./docs/adr/) as they're made.
 
-**Status: Phase 2 (webhook pipeline).** Phase 0 infra, Phase 1 auth +
-Connect onboarding, and now the Connect webhook endpoint
-(`/api/webhooks/stripe-connect`) — signature verification, idempotent
-outbox insert + enqueue, worker dispatch, retry/backoff, dead-letter status
-tracking — are all in place, with a real processor for
-`checkout.session.completed`. No Customer/Invoice creation UI yet, so that
-processor's Invoice lookup legitimately no-ops until Phase 3 — see
-`docs/adr/001-outbox-pattern.md`.
+**Status: Phase 3 (customers + invoices) complete, awaiting review.**
+Phase 0 infra, Phase 1 auth + Connect onboarding, Phase 2 webhook pipeline
+(signature verification, idempotent outbox insert + enqueue, worker
+dispatch, retry/backoff, dead-letter status tracking) and Phase 3 —
+customers and invoices created on the tenant's connected account, paid via
+one-time Checkout Sessions, with the payment outcome applied by the worker
+from Stripe's webhooks (ADR-006). Next: Phase 4, subscriptions.
 
 ## Architecture at a glance
 
@@ -74,77 +73,87 @@ npm run worker:dev           # in a second terminal — BullMQ worker + Bull Boa
 2. `/signup` to create a `User` (email + password, hashed with
    `crypto.scrypt` — see `docs/adr/004-auth-and-proxy-gate.md`), then log in.
 3. `/dashboard` shows Connect status and a "Connect Stripe" button
-   (`/api/connect/start`) if not yet connected.
+   (`/api/connect/start`) if not yet connected. Customers and invoices
+   unlock once Stripe reports the account can accept charges
+   (`onboardingComplete`).
+4. `/dashboard/customers` — add a customer (created on your connected
+   Stripe account too). Customers with invoices can't be deleted.
+5. `/dashboard/invoices` — create an invoice, share the Checkout link with
+   the customer. Its status moves `PENDING -> PAID` (or `FAILED` /
+   `EXPIRED`) when the worker processes Stripe's webhook, never from the
+   checkout redirect itself. Expired or failed invoices get a "New payment
+   link".
 
 There is **no `proxy.ts` auth gate** — each protected route/page checks the
 session itself. See `docs/adr/004-auth-and-proxy-gate.md` for why (short
 version: `next-auth@5` beta doesn't yet work with Next 16's `proxy.ts`
 rename).
 
-## Testing Stripe Connect locally
+## Testing with Stripe locally
 
-The OAuth round trip and `account.updated` webhook need a real Stripe
-account in test mode — nothing here can be faked:
+Everything goes through **one webhook endpoint**,
+`/api/webhooks/stripe-connect`, which must be scoped to **Connected
+accounts** — `account.updated` for a connected account is a
+Connected-accounts event too, not a platform one (see the amendment in
+[`docs/adr/003-stripe-connect-multitenancy.md`](./docs/adr/003-stripe-connect-multitenancy.md)).
 
-1. **Stripe Dashboard → Connect → Settings**: enable Standard accounts,
-   copy the OAuth `client_id` into `STRIPE_CONNECT_CLIENT_ID`, and register
-   `http://localhost:3000/api/connect/callback` as an OAuth redirect URI.
-2. **Stripe Dashboard → Developers → API keys**: copy the test secret key
-   into `STRIPE_SECRET_KEY`.
-3. **Platform webhook** (`account.updated` only): either register
-   `http://localhost:3000/api/webhooks/stripe-platform` as a normal webhook
-   endpoint if using a tunnel (ngrok/Cloudflare Tunnel), or, simpler for
-   local dev, use the Stripe CLI:
-   ```bash
-   stripe listen --events account.updated --forward-to localhost:3000/api/webhooks/stripe-platform
-   ```
-   The CLI prints a `whsec_...` value on startup — put that in
-   `STRIPE_WEBHOOK_SECRET` (it's a different value than what the Dashboard
-   would give you for a real endpoint, and changes every time you restart
-   `stripe listen` unless you pass `--latest`).
-4. Restart the `app` container (`docker compose up -d --build app`) so the
-   new env vars take effect, then go through `/dashboard` → "Connect
-   Stripe" with a real Stripe-hosted test account.
+### One-time Stripe setup (test mode)
 
-Without real Connect credentials, everything up to the redirect to Stripe's
-consent screen still works (verified via `curl` against the placeholder
-values in `.env.example`) — it's only the token exchange and the
-`account.updated` webhook that need the real thing.
+1. **Connect → Settings**: enable Standard accounts (OAuth), copy the
+   `client_id` into `STRIPE_CONNECT_CLIENT_ID`, and register
+   `http://localhost:3000/api/connect/callback` as a redirect URI.
+2. **Developers → API keys**: copy the test secret key into
+   `STRIPE_SECRET_KEY`.
+3. Optional: set `PLATFORM_FEE_BPS` (e.g. `250` = 2.5%) to take a platform
+   fee from each invoice payment.
 
-## Testing the Connect webhook pipeline (Phase 2) locally
-
-The Connect endpoint (`/api/webhooks/stripe-connect`) is a **separate**
-webhook endpoint from the platform one above, with its own secret
-(`STRIPE_CONNECT_WEBHOOK_SECRET`) — don't reuse the platform endpoint's
-`stripe listen` session for it, they need independent forwarding:
+### Forward webhooks with the Stripe CLI
 
 ```bash
-stripe listen --forward-to localhost:3000/api/webhooks/stripe-connect
+stripe listen --forward-connect-to localhost:3000/api/webhooks/stripe-connect
 ```
 
-Put the `whsec_...` this prints into `STRIPE_CONNECT_WEBHOOK_SECRET`
-(different from `STRIPE_WEBHOOK_SECRET`'s value, even though both may
-currently be the same placeholder if you haven't run this yet), restart the
-`app` container, then:
+`--forward-connect-to`, **not** `--forward-to` — the latter only forwards
+events of your own (platform) account, and would silently miss every event
+from connected accounts. Put the `whsec_...` it prints into
+`STRIPE_CONNECT_WEBHOOK_SECRET`, then restart the app container
+(`docker compose up -d app`) so it picks the value up.
 
-```bash
-stripe trigger checkout.session.completed
-```
+For a deployed environment, create the endpoint in the Dashboard with
+**Events from: Connected accounts** and enable at least the events the
+worker handles (`src/worker/processors/index.ts`): `account.updated`,
+`account.application.deauthorized`, `checkout.session.completed`,
+`checkout.session.async_payment_succeeded`,
+`checkout.session.async_payment_failed`, `checkout.session.expired`.
 
-Expect it to reach the worker and no-op — `docker logs stripe-saas-worker-1`
-should show `no Invoice for session ... — no-op`, and the corresponding
-`WebhookEvent` row should end up `status = PROCESSED`. That's correct: no
-UI creates an `Invoice` with a matching `stripeCheckoutSessionId` until
-Phase 3, so there's nothing for `stripe trigger`'s synthetic session to
-match against yet. The pipeline mechanics (signature check, idempotent
-insert, outbox enqueue, worker pickup, retry/backoff) are what's actually
-being exercised, not real business data.
+### End-to-end: connect, invoice, pay
 
-If you don't have `stripe listen` running, you can still exercise the
-endpoint directly with a validly-signed synthetic event using
-`Stripe.webhooks.generateTestHeaderString()` against whatever's currently in
-`STRIPE_CONNECT_WEBHOOK_SECRET` — this is how it was verified during
-development, without needing a live tunnel.
+1. Log in, "Connect Stripe", and finish onboarding the test account in
+   Stripe's hosted flow — the dashboard only unlocks invoicing once Stripe
+   reports `charges_enabled`. If an already-connected test account is stuck
+   on requirements (e.g. `individual.id_number`), complete them in that
+   account's Stripe Dashboard with
+   [test values](https://docs.stripe.com/connect/testing); the resulting
+   `account.updated` flips `onboardingComplete` through the worker.
+2. Add a customer, create an invoice, open the payment link, pay with
+   card `4242 4242 4242 4242` (any future expiry / CVC).
+3. The payer lands on the public `/pay/success` page; within a moment the
+   invoice shows `PAID` on `/dashboard/invoices`, a `Transaction` row
+   exists, and the job is visible in Bull Board
+   (http://localhost:3001/admin/queues).
+4. Duplicate delivery: resend that event (Stripe Dashboard → the event →
+   Resend, or `stripe events resend <evt_id> --stripe-account <acct_id>`)
+   — the endpoint acks it, nothing is applied twice.
+
+To fire a Connect-scoped test event without a real checkout:
+`stripe trigger --stripe-account acct_... checkout.session.completed`. It
+reaches the worker and no-ops (`no Invoice for session ...`) — that session
+wasn't created by PayFlow.
+
+Without the CLI, the endpoint can also be exercised with validly signed
+synthetic events via `Stripe.webhooks.generateTestHeaderString()` against
+`STRIPE_CONNECT_WEBHOOK_SECRET` — how the duplicate / concurrent /
+out-of-order scenarios were verified during development.
 
 ## Port conflicts
 
@@ -175,18 +184,16 @@ runtime), not an oversight.
 
 ## Environment variables
 
-See [`.env.example`](./.env.example) — every variable is documented inline,
-including why `STRIPE_WEBHOOK_SECRET` (platform endpoint, `account.updated`
-only, handled synchronously) and `STRIPE_CONNECT_WEBHOOK_SECRET` (Connect
-endpoint, payment-relevant events, routed through the outbox + BullMQ
-pipeline) are deliberately separate secrets — see
-[`docs/adr/003-stripe-connect-multitenancy.md`](./docs/adr/003-stripe-connect-multitenancy.md).
+See [`.env.example`](./.env.example) — every variable is documented inline.
+There is a single Stripe webhook secret, `STRIPE_CONNECT_WEBHOOK_SECRET`
+(an earlier platform endpoint with its own `STRIPE_WEBHOOK_SECRET` was
+removed — see the ADR-003 amendment).
 
-`NEXTAUTH_SECRET` and `NEXTAUTH_URL` are required as of Phase 1 (session JWT
-signing, and the base URL for the Connect `redirect_uri`) — `next dev` /
-`docker compose up` will fail fast with a clear Zod error if either is
-missing. Note that reading them happens lazily at request time, not at
-module import — see
+`NEXTAUTH_SECRET` and `NEXTAUTH_URL` are required (session JWT signing, and
+the base URL for the Connect `redirect_uri` and Checkout redirects) —
+`next dev` / `docker compose up` will fail fast with a clear Zod error if
+either is missing. Note that reading them happens lazily at request time,
+not at module import — see
 [`docs/adr/005-lazy-env-and-client-init.md`](./docs/adr/005-lazy-env-and-client-init.md)
 for why that distinction mattered enough to be its own ADR.
 
