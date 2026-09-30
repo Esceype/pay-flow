@@ -1,5 +1,6 @@
 import type { WebhookEvent } from "@prisma/client";
-import { processCheckoutSessionCompleted } from "./checkout-session-completed";
+import { processAccountDeauthorized, processAccountUpdated } from "./account";
+import { processCheckoutSessionEvent } from "./checkout-session";
 
 type Processor = (webhookEvent: WebhookEvent) => Promise<void>;
 
@@ -9,8 +10,16 @@ type Processor = (webhookEvent: WebhookEvent) => Promise<void>;
 // every connected account, and most aren't relevant yet (subscriptions:
 // Phase 4; refunds/disputes: not yet scoped). Silently accepting unhandled
 // types is correct: it's not a failure, just nothing to do yet.
+//
+// Each of these must be enabled on the Connect webhook endpoint in the
+// Stripe Dashboard (see README).
 const processors: Partial<Record<string, Processor>> = {
-  "checkout.session.completed": processCheckoutSessionCompleted,
+  "account.updated": processAccountUpdated,
+  "account.application.deauthorized": processAccountDeauthorized,
+  "checkout.session.completed": processCheckoutSessionEvent,
+  "checkout.session.async_payment_succeeded": processCheckoutSessionEvent,
+  "checkout.session.async_payment_failed": processCheckoutSessionEvent,
+  "checkout.session.expired": processCheckoutSessionEvent,
 };
 
 export function getProcessor(eventType: string): Processor | undefined {

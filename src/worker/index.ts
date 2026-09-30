@@ -1,4 +1,4 @@
-import { Worker, type Job } from "bullmq";
+import { UnrecoverableError, Worker, type Job } from "bullmq";
 import { env } from "../lib/env";
 import { getQueueRedis } from "../lib/redis";
 import { prisma } from "../lib/prisma";
@@ -15,9 +15,14 @@ const worker = new Worker(
   async (job: Job<WebhookJobData>) => {
     const { webhookEventId } = job.data;
 
-    const webhookEvent = await prisma.webhookEvent.findUniqueOrThrow({
+    const webhookEvent = await prisma.webhookEvent.findUnique({
       where: { id: webhookEventId },
     });
+    if (!webhookEvent) {
+      // The job only carries an id; without the durable row there is
+      // nothing to process, and retrying won't make it appear.
+      throw new UnrecoverableError(`WebhookEvent ${webhookEventId} not found`);
+    }
 
     if (webhookEvent.status === "PROCESSED") {
       // Re-enqueued job for an event already finished (ADR-001's jobId
@@ -61,12 +66,14 @@ worker.on("failed", async (job, err) => {
 
   if (!job) return;
 
-  // Only mark the WebhookEvent FAILED once BullMQ has exhausted every
-  // retry attempt — an intermediate failure still has retries coming
-  // (exponential backoff, src/lib/queue.ts) and should stay PROCESSING so
-  // it reads as "in flight," not "dead," if inspected mid-retry.
+  // Only mark the WebhookEvent FAILED once the job is actually dead: every
+  // retry attempt exhausted, or a processor threw UnrecoverableError
+  // (BullMQ skips the remaining retries for those). An intermediate failure
+  // still has retries coming (exponential backoff, src/lib/queue.ts) and
+  // should stay PROCESSING so it reads as "in flight," not "dead."
   const attemptsMax = job.opts.attempts ?? 1;
-  if (job.attemptsMade < attemptsMax) return;
+  const unrecoverable = err.name === UnrecoverableError.name;
+  if (!unrecoverable && job.attemptsMade < attemptsMax) return;
 
   const { webhookEventId } = job.data as WebhookJobData;
   await prisma.webhookEvent

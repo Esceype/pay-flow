@@ -2,23 +2,36 @@
 
 import { z } from "zod";
 import { redirect } from "next/navigation";
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
-import { stripe } from "@/lib/stripe";
-import { env } from "@/lib/env";
+import {
+  applicationFeeFor,
+  BillingError,
+  CURRENCIES,
+  getOrCreatePaymentLink,
+  type Currency,
+} from "@/lib/billing";
 import { requireOnboardedUser, TenantError } from "@/lib/tenant";
 
 const invoiceSchema = z.object({
   customerId: z.string().min(1),
-  // Dollars as typed by the user (e.g. "19.99") — converted to integer
-  // cents below, since Stripe and our own Invoice.amountDue are both cents.
-  amount: z.coerce.number().positive(),
-  currency: z
-    .string()
-    .trim()
-    .toLowerCase()
-    .regex(/^[a-z]{3}$/, "currency must be a 3-letter ISO code")
-    .default("usd"),
+  // Dollars as typed (e.g. "19.99"), parsed as a string rather than a float
+  // so the cents conversion below is exact.
+  amount: z.string().trim().regex(/^\d+(\.\d{1,2})?$/),
+  currency: z.enum(Object.keys(CURRENCIES) as [Currency, ...Currency[]]),
+  // Per-render form token (see page.tsx): makes the create request itself
+  // idempotent — a double-submit reuses the invoice instead of adding one.
+  requestKey: z.string().uuid(),
 });
+
+function toMinorUnits(amount: string): number {
+  const [whole, fraction = ""] = amount.split(".");
+  return Number(whole) * 100 + Number(fraction.padEnd(2, "0"));
+}
+
+function linkRedirect(checkoutUrl: string): never {
+  redirect(`/dashboard/invoices?checkout_url=${encodeURIComponent(checkoutUrl)}`);
+}
 
 // See the control-flow note in customers/actions.ts — same rule applies
 // here: redirect() must never be called from inside a try block whose own
@@ -34,71 +47,76 @@ export async function createInvoice(formData: FormData) {
   const parsed = invoiceSchema.safeParse({
     customerId: formData.get("customerId"),
     amount: formData.get("amount"),
-    currency: formData.get("currency") || undefined,
+    currency: formData.get("currency"),
+    requestKey: formData.get("requestKey"),
   });
   if (!parsed.success) {
     redirect("/dashboard/invoices?error=invalid_input");
   }
 
+  const amountDue = toMinorUnits(parsed.data.amount);
+  if (amountDue < CURRENCIES[parsed.data.currency].minAmount) {
+    redirect("/dashboard/invoices?error=amount_too_small");
+  }
+
   const customer = await prisma.customer.findFirst({
     where: { id: parsed.data.customerId, userId: user.id },
+    select: { id: true },
   });
-  if (!customer?.stripeCustomerId) {
+  if (!customer) {
     redirect("/dashboard/invoices?error=invalid_customer");
   }
 
-  const amountDue = Math.round(parsed.data.amount * 100);
-
-  let checkoutUrl: string | null;
+  // Intent-first (ADR-006): the invoice row exists before any Stripe call,
+  // so its id can key the Checkout Session idempotently, and a failure
+  // after this point leaves a PENDING invoice whose link can be retried —
+  // never a Stripe session that nothing in our database points to.
+  let invoiceId: string;
   try {
-    // Checkout Session, not Stripe's native Invoicing API — this project
-    // models "Invoice" as our own record tied to a one-time Checkout
-    // Session (Invoice.stripeInvoiceId stays null), not Stripe's Invoice
-    // object. Created on the connected account (stripeAccount), never the
-    // platform.
-    const checkoutSession = await stripe.checkout.sessions.create(
-      {
-        mode: "payment",
-        customer: customer.stripeCustomerId,
-        line_items: [
-          {
-            price_data: {
-              currency: parsed.data.currency,
-              product_data: { name: `Invoice for ${customer.email}` },
-              unit_amount: amountDue,
-            },
-            quantity: 1,
-          },
-        ],
-        success_url: `${env.NEXTAUTH_URL}/dashboard/invoices?paid=1`,
-        cancel_url: `${env.NEXTAUTH_URL}/dashboard/invoices?canceled=1`,
-      },
-      { stripeAccount: user.stripeAccountId }
-    );
-
-    await prisma.invoice.create({
+    const invoice = await prisma.invoice.create({
       data: {
         customerId: customer.id,
-        stripeCheckoutSessionId: checkoutSession.id,
+        userId: user.id,
+        requestKey: parsed.data.requestKey,
         amountDue,
         currency: parsed.data.currency,
+        applicationFeeAmount: applicationFeeFor(amountDue),
         status: "PENDING",
       },
     });
-
-    checkoutUrl = checkoutSession.url;
+    invoiceId = invoice.id;
   } catch (err) {
-    console.error("[createInvoice] failed", err);
-    redirect("/dashboard/invoices?error=create_failed");
+    if (!(err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002")) {
+      console.error("[createInvoice] failed", err);
+      redirect("/dashboard/invoices?error=create_failed");
+    }
+    // Same requestKey: this form was already submitted (double-click, or a
+    // retry after a slow response). Continue with the invoice it created.
+    const existing = await prisma.invoice.findFirst({
+      where: { requestKey: parsed.data.requestKey, userId: user.id },
+      select: { id: true },
+    });
+    if (!existing) {
+      redirect("/dashboard/invoices?error=create_failed");
+    }
+    invoiceId = existing.id;
   }
 
-  redirect(`/dashboard/invoices?checkout_url=${encodeURIComponent(checkoutUrl ?? "")}`);
+  let checkoutUrl: string;
+  try {
+    checkoutUrl = await getOrCreatePaymentLink(invoiceId, user);
+  } catch (err) {
+    console.error("[createInvoice] payment link failed", err);
+    redirect("/dashboard/invoices?error=link_pending");
+  }
+
+  linkRedirect(checkoutUrl);
 }
 
-// Checkout Session URLs aren't stored (they're just re-derivable from
-// Stripe, and storing a second copy of something Stripe already owns isn't
-// worth it) — this re-fetches one for a still-PENDING invoice so it can be
-// shared again after the create-time redirect display is gone.
+// Checkout Session URLs aren't stored (they're re-derivable from Stripe,
+// and storing a second copy of something Stripe already owns isn't worth
+// it). This returns the open session's URL, or issues a new session if the
+// previous one expired or its async payment failed.
 export async function getInvoiceLink(formData: FormData) {
   let user;
   try {
@@ -112,25 +130,16 @@ export async function getInvoiceLink(formData: FormData) {
     redirect("/dashboard/invoices?error=invalid_input");
   }
 
-  const invoice = await prisma.invoice.findFirst({
-    where: { id: invoiceId, customer: { userId: user.id } },
-  });
-  if (!invoice?.stripeCheckoutSessionId) {
-    redirect("/dashboard/invoices?error=invalid_invoice");
-  }
-
-  let checkoutUrl: string | null;
+  let checkoutUrl: string;
   try {
-    const checkoutSession = await stripe.checkout.sessions.retrieve(
-      invoice.stripeCheckoutSessionId,
-      {},
-      { stripeAccount: user.stripeAccountId }
-    );
-    checkoutUrl = checkoutSession.url;
+    checkoutUrl = await getOrCreatePaymentLink(invoiceId, user);
   } catch (err) {
+    if (err instanceof BillingError) {
+      redirect(`/dashboard/invoices?error=${err.message}`);
+    }
     console.error("[getInvoiceLink] failed", err);
     redirect("/dashboard/invoices?error=link_failed");
   }
 
-  redirect(`/dashboard/invoices?checkout_url=${encodeURIComponent(checkoutUrl ?? "")}`);
+  linkRedirect(checkoutUrl);
 }

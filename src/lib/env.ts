@@ -1,8 +1,9 @@
 import { z } from "zod";
 
-// Only DATABASE_URL and REDIS_URL are required at this phase — everything
-// else (Stripe, auth, email) is wired up in later phases and validated
-// loosely for now so Phase 0 infra can boot without those credentials set.
+// Required: database, Redis, and the Auth.js pair. Stripe/email values stay
+// optional so the infra (and `next build`) can boot without real
+// credentials — each call site fails with a clear error when it actually
+// needs one that's missing.
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   DATABASE_URL: z.string().url(),
@@ -10,12 +11,13 @@ const envSchema = z.object({
 
   STRIPE_SECRET_KEY: z.string().optional(),
   STRIPE_CONNECT_CLIENT_ID: z.string().optional(),
-  // Platform webhook endpoint secret (account.updated only). See
-  // .env.example for why this is a separate secret from the one below.
-  STRIPE_WEBHOOK_SECRET: z.string().optional(),
-  // Connect webhook endpoint secret (payment-relevant events from connected
-  // accounts, routed through the outbox + BullMQ pipeline).
+  // Signing secret of the Connect webhook endpoint (every event from
+  // connected accounts, account.updated included — ADR-003), routed
+  // through the outbox + BullMQ pipeline.
   STRIPE_CONNECT_WEBHOOK_SECRET: z.string().optional(),
+  // Platform fee on each invoice payment, in basis points (250 = 2.5%),
+  // taken via application_fee_amount on the direct charge. 0 disables it.
+  PLATFORM_FEE_BPS: z.coerce.number().int().min(0).max(10_000).default(0),
 
   RESEND_API_KEY: z.string().optional(),
   // Required as of Phase 1: NEXTAUTH_SECRET signs session JWTs, and

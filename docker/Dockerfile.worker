@@ -3,8 +3,9 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 COPY prisma ./prisma
 # devDependencies are kept (no --omit=dev): the worker runs TypeScript
-# directly via tsx rather than a separate compile step — see README for the
-# tradeoff and the deferred tsc+tsc-alias optimization.
+# directly via tsx rather than a separate compile step. Simpler, at the cost
+# of a larger image and a little startup time; compiling with tsc (+
+# tsc-alias for path aliases) and --omit=dev is the deferred optimization.
 RUN npm ci
 COPY tsconfig.json ./
 COPY src ./src

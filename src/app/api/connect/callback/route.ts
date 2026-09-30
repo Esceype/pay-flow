@@ -56,7 +56,9 @@ export async function GET(request: Request) {
   try {
     await prisma.user.update({
       where: { id: session.user.id },
-      data: { stripeAccountId },
+      // stripeConnectedAt: ordering guard for a later (or stale, queued)
+      // account.application.deauthorized — see unlinkConnectAccount().
+      data: { stripeAccountId, stripeConnectedAt: new Date() },
     });
   } catch (err) {
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {

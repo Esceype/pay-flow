@@ -36,18 +36,25 @@ model User {
   // Stripe Connect (Standard account). Both are null until the tenant starts
   // onboarding; onboardingComplete flips to true only once Stripe confirms
   // the account can accept charges (see account.updated handling, ADR-003).
+  // @unique already creates the index the Connect webhook's tenant lookup
+  // needs — no separate @@index on top of it.
   stripeAccountId    String? @unique
   onboardingComplete Boolean @default(false)
+
+  // When the current stripeAccountId was linked (OAuth callback). Ordering
+  // guard for account.application.deauthorized: a queued deauthorization
+  // whose event.created predates this is stale (the tenant has since
+  // reconnected) and must not unlink the fresh connection. ADR-003.
+  stripeConnectedAt DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   customers     Customer[]
+  invoices      Invoice[]
   transactions  Transaction[]
   webhookEvents WebhookEvent[]
   revenueStats  MaterializedRevenueStats?
-
-  @@index([stripeAccountId])
 }
 
 model Customer {
@@ -66,38 +73,68 @@ model Customer {
   invoices      Invoice[]
   subscriptions Subscription[]
 
-  @@index([userId, email])
+  // One customer per email per tenant. Unique (not just an index) so a
+  // double-submitted "add customer" form fails on the constraint instead of
+  // creating a twin. The unique index also serves the (userId, email)
+  // lookup the plain index used to.
+  @@unique([userId, email])
 }
 
 enum InvoiceStatus {
-  PENDING
+  PENDING // awaiting payment (includes async methods still settling)
   PAID
-  FAILED
+  FAILED // async payment method failed after checkout completed
+  EXPIRED // Checkout Session expired unpaid — a new link can be generated
   VOID
 }
 
 model Invoice {
   id         String   @id @default(cuid())
+  // Restrict, not Cascade: a customer with invoices cannot be deleted —
+  // billing history must never disappear as a side effect. The app checks
+  // this first for a friendly error; the FK is the backstop.
   customerId String
-  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
 
+  // Denormalized tenant id (same reasoning as Transaction.userId): the
+  // invoice list is "this tenant's invoices, newest first", which should
+  // not need a join through Customer.
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Idempotency key for the create-invoice request itself: rendered into
+  // the form as a hidden field, so a double-submit hits this unique
+  // constraint instead of creating a second invoice. ADR-006.
+  requestKey String @unique
+
+  // Not used: invoices are our own records backed by a one-time Checkout
+  // Session, not Stripe Invoice objects (ADR-006). Kept for a possible
+  // future move to Stripe Invoicing.
   stripeInvoiceId         String? @unique
+  // Null only briefly (intent-first: the row is written before the session
+  // exists) or if session creation failed — "Get payment link" retries it.
   stripeCheckoutSessionId String? @unique
 
   status    InvoiceStatus @default(PENDING)
   amountDue Int // cents
   currency  String        @default("usd")
+  // Platform fee (cents) taken from this payment via application_fee_amount
+  // on the direct charge. Snapshotted at creation so a later fee-rate change
+  // never rewrites what an existing invoice charged.
+  applicationFeeAmount Int @default(0)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   transactions Transaction[]
 
-  // Real query pattern: "this tenant's invoices in status X", scoped through
-  // the customer. Composite over separate indexes because Postgres serves
-  // "WHERE customerId = ? AND status = ?" from one btree scan instead of
-  // intersecting two.
+  // Real query pattern: "this customer's invoices in status X" (e.g. the
+  // has-invoices check before deleting a customer). Composite over separate
+  // indexes because Postgres serves "WHERE customerId = ? AND status = ?"
+  // from one btree scan instead of intersecting two.
   @@index([customerId, status])
+  // Tenant invoice list, newest first — one index scan, no sort.
+  @@index([userId, createdAt])
 }
 
 enum SubscriptionStatus {
@@ -111,7 +148,8 @@ enum SubscriptionStatus {
 model Subscription {
   id         String   @id @default(cuid())
   customerId String
-  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  // Restrict for the same reason as Invoice.customer.
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
 
   stripeSubscriptionId String             @unique
   status               SubscriptionStatus @default(INCOMPLETE)
@@ -164,7 +202,9 @@ model Transaction {
 }
 
 enum WebhookEventStatus {
-  RECEIVED // outbox row inserted, BullMQ job enqueued in the same transaction
+  // Outbox row inserted; the BullMQ job is enqueued right after as a
+  // separate, idempotent step — not in the same transaction (ADR-001).
+  RECEIVED
   PROCESSING
   PROCESSED
   FAILED
@@ -177,10 +217,10 @@ model WebhookEvent {
   // across the platform and every connected account.
   stripeEventId String @unique
 
-  // Present for events from the Connect webhook endpoint (payment-relevant,
-  // tagged with an `account` field in the Stripe payload). Null for
-  // platform-endpoint events, which in this project is just
-  // `account.updated`.
+  // The connected account the event came from (`event.account`). Every
+  // event this project consumes is Connected-accounts scoped, including
+  // account.updated (ADR-003) — null only for a misrouted event without an
+  // `account` field.
   stripeAccountId String?
 
   // Resolved tenant. Nullable because resolution can fail (unrecognized
@@ -192,11 +232,8 @@ model WebhookEvent {
   type    String // Stripe event type, e.g. "checkout.session.completed"
   payload Json // raw event payload, for replay/debugging
 
-  // account.updated (platform endpoint) is NOT a payment event: it is
-  // handled synchronously in the request handler, no outbox/queue involved
-  // — there is nothing to lose by processing it inline, and doing so avoids
-  // a queue hop for a plain status-flag flip. Everything from the Connect
-  // endpoint goes through the outbox + BullMQ pipeline. See ADR-003.
+  // Every event goes through the outbox + BullMQ pipeline, account.updated
+  // included (ADR-003, amended).
   status WebhookEventStatus @default(RECEIVED)
 
   receivedAt  DateTime  @default(now())

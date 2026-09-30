@@ -7,7 +7,10 @@ const ERROR_MESSAGES: Record<string, string> = {
   invalid_input: "Please provide a valid email.",
   duplicate: "That email is already a customer.",
   create_failed: "Couldn't create the customer — please try again.",
+  stripe_sync_pending:
+    "Customer saved, but not yet registered on your Stripe account — this is retried automatically when you create their first invoice.",
   delete_failed: "Couldn't delete the customer — please try again.",
+  has_invoices: "Customers with invoices can't be deleted — billing history is kept.",
 };
 
 export default async function CustomersPage({
@@ -29,6 +32,7 @@ export default async function CustomersPage({
     prisma.customer.findMany({
       where: { userId: session.user.id },
       orderBy: { createdAt: "desc" },
+      include: { _count: { select: { invoices: true } } },
     }),
   ]);
 
@@ -99,12 +103,14 @@ export default async function CustomersPage({
                   >
                     New invoice
                   </a>
-                  <form action={deleteCustomer} className="inline">
-                    <input type="hidden" name="customerId" value={customer.id} />
-                    <button type="submit" className="text-red-700 underline">
-                      Delete
-                    </button>
-                  </form>
+                  {customer._count.invoices === 0 && (
+                    <form action={deleteCustomer} className="inline">
+                      <input type="hidden" name="customerId" value={customer.id} />
+                      <button type="submit" className="text-red-700 underline">
+                        Delete
+                      </button>
+                    </form>
+                  )}
                 </td>
               </tr>
             ))}

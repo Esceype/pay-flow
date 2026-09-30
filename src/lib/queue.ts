@@ -22,8 +22,8 @@ export function getWebhookEventsQueue(): Queue {
       // Keep completed jobs around briefly so Bull Board is actually useful
       // for spot-checking recent activity, then let them drop.
       removeOnComplete: { age: 3600 },
-      // Failed jobs are kept indefinitely until Phase 2's dead-letter
-      // handling explicitly moves/clears them — losing a failed payment
+      // Failed jobs are kept indefinitely (the dead-letter view in Bull
+      // Board; WebhookEvent is also marked FAILED) — losing a failed payment
       // webhook silently is not acceptable.
       removeOnFail: false,
     },

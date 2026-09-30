@@ -8,9 +8,8 @@ import { getConnectRedirectUri } from "@/lib/stripe-connect";
 const STATE_COOKIE = "stripe_connect_state";
 
 export async function GET() {
-  // Defense in depth: proxy.ts already gates /api/connect/*, but a route
-  // move or matcher edit could silently drop that coverage (see the
-  // warning in Next's own proxy docs) — check the session here too.
+  // No proxy.ts gate exists (ADR-004) — every protected route checks the
+  // session itself.
   const session = await auth();
   if (!session?.user) {
     return NextResponse.redirect(new URL("/login", env.NEXTAUTH_URL));

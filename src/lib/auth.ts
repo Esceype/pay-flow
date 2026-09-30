@@ -32,7 +32,8 @@ export const { handlers, auth, signIn, signOut } = NextAuth(() => ({
         const password = credentials?.password;
         if (typeof email !== "string" || typeof password !== "string") return null;
 
-        const user = await prisma.user.findUnique({ where: { email } });
+        // Normalized the same way as on signup (trim + lowercase).
+        const user = await prisma.user.findUnique({ where: { email: email.trim().toLowerCase() } });
         if (!user?.hashedPassword) return null;
 
         const valid = await verifyPassword(password, user.hashedPassword);
