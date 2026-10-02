@@ -8,6 +8,9 @@ const CONNECT_ERROR_MESSAGES: Record<string, string> = {
   token_exchange_failed: "Stripe couldn't confirm the connection — please try again.",
   missing_account_id: "Stripe didn't return an account id — please try again.",
   account_already_linked: "That Stripe account is already linked to a different user.",
+  onboarding_link_failed:
+    "Couldn't open Stripe's onboarding for this account — complete the outstanding requirements in your Stripe Dashboard, then come back.",
+  status_sync_failed: "Couldn't refresh your Stripe account status — please reload in a moment.",
 };
 
 export default async function DashboardPage({
@@ -56,8 +59,10 @@ export default async function DashboardPage({
               onboarding is complete yet (details submission and/or charge capability
               pending).
             </p>
+            {/* Not /api/connect/start: re-running OAuth only re-links the
+                same account, it never collects the missing requirements. */}
             <a
-              href="/api/connect/start"
+              href="/api/connect/onboarding"
               className="w-fit rounded bg-black px-3 py-2 text-sm text-white hover:bg-neutral-800"
             >
               Finish Stripe onboarding

@@ -130,11 +130,14 @@ worker handles (`src/worker/processors/index.ts`): `account.updated`,
 
 1. Log in, "Connect Stripe", and finish onboarding the test account in
    Stripe's hosted flow — the dashboard only unlocks invoicing once Stripe
-   reports `charges_enabled`. If an already-connected test account is stuck
-   on requirements (e.g. `individual.id_number`), complete them in that
-   account's Stripe Dashboard with
-   [test values](https://docs.stripe.com/connect/testing); the resulting
-   `account.updated` flips `onboardingComplete` through the worker.
+   reports `charges_enabled`. If the linked account still has outstanding
+   requirements (e.g. `individual.id_number`), the dashboard shows "Finish
+   Stripe onboarding": it opens Stripe's hosted onboarding via an Account
+   Link (`/api/connect/onboarding`) — re-running OAuth would only re-link
+   the same account without collecting anything. Fill it in with
+   [test values](https://docs.stripe.com/connect/testing); on return
+   (`/api/connect/return`) the status is re-read from Stripe, and the
+   `account.updated` webhook does the same through the worker.
 2. Add a customer, create an invoice, open the payment link, pay with
    card `4242 4242 4242 4242` (any future expiry / CVC).
 3. The payer lands on the public `/pay/success` page; within a moment the
