@@ -117,7 +117,16 @@ stripe listen --forward-connect-to localhost:3000/api/webhooks/stripe-connect
 events of your own (platform) account, and would silently miss every event
 from connected accounts. Put the `whsec_...` it prints into
 `STRIPE_CONNECT_WEBHOOK_SECRET`, then restart the app container
-(`docker compose up -d app`) so it picks the value up.
+(`docker compose up -d --force-recreate app`) so it picks the value up.
+
+**The CLI must listen on the same Stripe account as `STRIPE_SECRET_KEY`.**
+If the key belongs to a sandbox but `stripe login` picked your main
+account, `stripe listen` runs happily and forwards nothing: no events in
+`WebhookEvent`, no signature errors, invoices stuck on `PENDING`. Compare
+`stripe config --list` (`account_id`) with the platform account, and either
+`stripe login` into the right one or pass the key explicitly:
+`stripe listen --api-key sk_test_... --forward-connect-to ...`. The
+`whsec_...` secret differs per account, so update it after switching.
 
 For a deployed environment, create the endpoint in the Dashboard with
 **Events from: Connected accounts** and enable at least the events the
@@ -144,9 +153,11 @@ worker handles (`src/worker/processors/index.ts`): `account.updated`,
    invoice shows `PAID` on `/dashboard/invoices`, a `Transaction` row
    exists, and the job is visible in Bull Board
    (http://localhost:3001/admin/queues).
-4. Duplicate delivery: resend that event (Stripe Dashboard → the event →
-   Resend, or `stripe events resend <evt_id> --stripe-account <acct_id>`)
-   — the endpoint acks it, nothing is applied twice.
+4. Duplicate delivery: resend that event with
+   `stripe events resend <evt_id> --account <acct_id>` (`--account`, not
+   `--stripe-account`) — the endpoint acks it, nothing is applied twice.
+   The same command recovers an event that was missed while no listener
+   was running.
 
 To fire a Connect-scoped test event without a real checkout:
 `stripe trigger --stripe-account acct_... checkout.session.completed`. It
