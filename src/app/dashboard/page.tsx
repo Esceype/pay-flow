@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation";
 import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { syncConnectAccountStatus } from "@/lib/stripe-connect";
 
 const CONNECT_ERROR_MESSAGES: Record<string, string> = {
   access_denied: "You declined to connect your Stripe account.",
@@ -30,6 +31,22 @@ export default async function DashboardPage({
     where: { id: session.user.id },
     select: { email: true, stripeAccountId: true, onboardingComplete: true },
   });
+
+  // Read-repair: account.updated (via the worker) is the primary way this
+  // flag gets updated, but Stripe often finishes verifying an account a
+  // little after the tenant returns from onboarding — and if that webhook
+  // is delayed or never arrives (e.g. local dev without `stripe listen`),
+  // the tenant would stay stuck here. Only in this linked-but-incomplete
+  // state, so complete tenants never pay for a Stripe API call per page view.
+  if (user.stripeAccountId && !user.onboardingComplete) {
+    try {
+      user.onboardingComplete =
+        (await syncConnectAccountStatus(user.stripeAccountId)) ?? user.onboardingComplete;
+    } catch (err) {
+      // Best effort — the stored flag is still a valid (if stale) answer.
+      console.error("[dashboard] Connect status read-repair failed", err);
+    }
+  }
 
   const connectError = params.connect_error
     ? (CONNECT_ERROR_MESSAGES[params.connect_error] ?? "Something went wrong connecting Stripe.")
