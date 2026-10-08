@@ -8,7 +8,7 @@ Architecture rationale and phased build plan:
 [`stripe-saas-senior-architecture-plan.md`](./stripe-saas-senior-architecture-plan.md).
 Individual decisions are recorded in [`docs/adr/`](./docs/adr/) as they're made.
 
-**Status: Phase 3 (customers + invoices) complete, awaiting review.**
+**Status: Phase 3 (customers + invoices) complete.**
 Phase 0 infra, Phase 1 auth + Connect onboarding, Phase 2 webhook pipeline
 (signature verification, idempotent outbox insert + enqueue, worker
 dispatch, retry/backoff, dead-letter status tracking) and Phase 3 —

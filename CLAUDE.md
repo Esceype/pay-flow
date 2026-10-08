@@ -203,7 +203,7 @@ in JS.) Invoice transitions don't need timestamps: each is a conditional
    `.deleted` racing) — moved to Phase 4, where the subscription processors
    that would actually need it get built. Building it now with nothing to
    call it would be speculative.
-3. ✅ (awaiting review) Customer CRUD + Checkout-backed invoices on the
+3. ✅ Customer CRUD + Checkout-backed invoices on the
    connected account (ADR-006): intent-first writes + Stripe idempotency
    keys, invoice state machine for all four Checkout events (async payment
    methods, expiry → "New payment link"), tenant check in the processor,
@@ -214,9 +214,14 @@ in JS.) Invoice transitions don't need timestamps: each is a conditional
    succeeded, 3 concurrent "paid" events → 1 Transaction, duplicate, expiry,
    tenant mismatch → FAILED without retries, stale vs fresh
    deauthorization, `account.updated` against the real test account).
-   Real browser checkout not yet done: the connected test account
-   (`phase3@example.com`) has `charges_enabled: false` pending
-   `individual.id_number`.
+   Then reviewed and verified end to end in the browser against the Stripe
+   sandbox: hosted onboarding via Account Link (`/api/connect/onboarding`,
+   with read-repair of `onboardingComplete` on the dashboard), customer →
+   invoice → card payment → `PAID` + `Transaction` + platform fee, duplicate
+   delivery via `stripe events resend`, session expiry → `EXPIRED` → "New
+   payment link". Local gotcha that cost time: the Stripe CLI must be logged
+   into the same account (sandbox) as `STRIPE_SECRET_KEY`, otherwise
+   `stripe listen` forwards nothing — pass `--api-key` (see README).
 4. Subscriptions + lifecycle webhooks through the same pipeline (+ ordering
    guard, see above). Decide first how Stripe's subscription invoices relate
    to our `Invoice` model (ADR-006, "Revisit before Phase 4").
