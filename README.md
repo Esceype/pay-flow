@@ -1,5 +1,7 @@
 # PayFlow
 
+[![CI](https://github.com/Esceype/pay-flow/actions/workflows/ci.yml/badge.svg)](https://github.com/Esceype/pay-flow/actions/workflows/ci.yml)
+
 Stripe Connect subscription & invoicing SaaS. Multi-tenant: each `User`
 (tenant) connects their own Stripe account via Stripe Connect (Standard
 accounts) — PayFlow itself never holds tenant funds.
