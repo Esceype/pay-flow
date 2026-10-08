@@ -19,6 +19,7 @@ export default async function DashboardLayout({ children }: { children: React.Re
           <Link href="/dashboard" className="hover:underline">Dashboard</Link>
           <Link href="/dashboard/customers" className="hover:underline">Customers</Link>
           <Link href="/dashboard/invoices" className="hover:underline">Invoices</Link>
+          <Link href="/dashboard/subscriptions" className="hover:underline">Subscriptions</Link>
         </div>
         <form
           action={async () => {

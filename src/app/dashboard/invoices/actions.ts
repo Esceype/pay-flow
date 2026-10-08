@@ -5,10 +5,13 @@ import { redirect } from "next/navigation";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import {
+  AMOUNT_PATTERN,
   applicationFeeFor,
   BillingError,
   CURRENCIES,
   getOrCreatePaymentLink,
+  MAX_AMOUNT,
+  toMinorUnits,
   type Currency,
 } from "@/lib/billing";
 import { requireOnboardedUser, TenantError } from "@/lib/tenant";
@@ -17,17 +20,12 @@ const invoiceSchema = z.object({
   customerId: z.string().min(1),
   // Dollars as typed (e.g. "19.99"), parsed as a string rather than a float
   // so the cents conversion below is exact.
-  amount: z.string().trim().regex(/^\d+(\.\d{1,2})?$/),
+  amount: z.string().trim().regex(AMOUNT_PATTERN),
   currency: z.enum(Object.keys(CURRENCIES) as [Currency, ...Currency[]]),
   // Per-render form token (see page.tsx): makes the create request itself
   // idempotent — a double-submit reuses the invoice instead of adding one.
   requestKey: z.string().uuid(),
 });
-
-function toMinorUnits(amount: string): number {
-  const [whole, fraction = ""] = amount.split(".");
-  return Number(whole) * 100 + Number(fraction.padEnd(2, "0"));
-}
 
 function linkRedirect(checkoutUrl: string): never {
   redirect(`/dashboard/invoices?checkout_url=${encodeURIComponent(checkoutUrl)}`);
@@ -57,6 +55,9 @@ export async function createInvoice(formData: FormData) {
   const amountDue = toMinorUnits(parsed.data.amount);
   if (amountDue < CURRENCIES[parsed.data.currency].minAmount) {
     redirect("/dashboard/invoices?error=amount_too_small");
+  }
+  if (amountDue > MAX_AMOUNT) {
+    redirect("/dashboard/invoices?error=amount_too_large");
   }
 
   const customer = await prisma.customer.findFirst({

@@ -56,6 +56,13 @@ export async function processCheckoutSessionEvent(webhookEvent: WebhookEvent): P
   const event = webhookEvent.payload as unknown as CheckoutEvent;
   const session = event.data.object;
 
+  if (session.mode === "subscription") {
+    // A subscription's Checkout: its state comes from customer.subscription.*
+    // and its payments from invoice.paid (processors/subscription.ts).
+    // Invoices are only ever paid through mode "payment" sessions.
+    return;
+  }
+
   const invoice = await prisma.invoice.findUnique({
     where: { stripeCheckoutSessionId: session.id },
     select: { id: true, userId: true, amountDue: true, currency: true },

@@ -8,6 +8,7 @@ import { createInvoice, getInvoiceLink } from "./actions";
 const ERROR_MESSAGES: Record<string, string> = {
   invalid_input: "Please fill in all fields with valid values (amount like 19.99).",
   amount_too_small: "That amount is below Stripe's minimum charge for this currency.",
+  amount_too_large: "That amount is above the maximum for a single charge (999,999.99).",
   invalid_customer: "That customer couldn't be found.",
   invalid_invoice: "That invoice couldn't be found.",
   create_failed: "Couldn't create the invoice — please try again.",

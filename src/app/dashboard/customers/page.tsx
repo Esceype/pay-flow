@@ -10,7 +10,8 @@ const ERROR_MESSAGES: Record<string, string> = {
   stripe_sync_pending:
     "Customer saved, but not yet registered on your Stripe account — this is retried automatically when you create their first invoice.",
   delete_failed: "Couldn't delete the customer — please try again.",
-  has_invoices: "Customers with invoices can't be deleted — billing history is kept.",
+  has_invoices:
+    "Customers with invoices or subscriptions can't be deleted — billing history is kept.",
 };
 
 export default async function CustomersPage({
@@ -32,7 +33,7 @@ export default async function CustomersPage({
     prisma.customer.findMany({
       where: { userId: session.user.id },
       orderBy: { createdAt: "desc" },
-      include: { _count: { select: { invoices: true } } },
+      include: { _count: { select: { invoices: true, subscriptions: true } } },
     }),
   ]);
 
@@ -103,7 +104,13 @@ export default async function CustomersPage({
                   >
                     New invoice
                   </a>
-                  {customer._count.invoices === 0 && (
+                  <a
+                    href={`/dashboard/subscriptions?customerId=${customer.id}`}
+                    className="mr-3 underline"
+                  >
+                    New subscription
+                  </a>
+                  {customer._count.invoices === 0 && customer._count.subscriptions === 0 && (
                     <form action={deleteCustomer} className="inline">
                       <input type="hidden" name="customerId" value={customer.id} />
                       <button type="submit" className="text-red-700 underline">

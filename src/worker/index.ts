@@ -3,7 +3,7 @@ import { env } from "../lib/env";
 import { getQueueRedis } from "../lib/redis";
 import { prisma } from "../lib/prisma";
 import { QUEUE_NAMES } from "../lib/queue";
-import { getProcessor } from "./processors";
+import { handleWebhookEvent } from "./handle-webhook-event";
 import { startAdminServer } from "./server";
 
 interface WebhookJobData {
@@ -12,42 +12,7 @@ interface WebhookJobData {
 
 const worker = new Worker(
   QUEUE_NAMES.webhookEvents,
-  async (job: Job<WebhookJobData>) => {
-    const { webhookEventId } = job.data;
-
-    const webhookEvent = await prisma.webhookEvent.findUnique({
-      where: { id: webhookEventId },
-    });
-    if (!webhookEvent) {
-      // The job only carries an id; without the durable row there is
-      // nothing to process, and retrying won't make it appear.
-      throw new UnrecoverableError(`WebhookEvent ${webhookEventId} not found`);
-    }
-
-    if (webhookEvent.status === "PROCESSED") {
-      // Re-enqueued job for an event already finished (ADR-001's jobId
-      // dedup covers the common case, but isn't airtight against every
-      // retry timing) — idempotent no-op.
-      return;
-    }
-
-    await prisma.webhookEvent.update({
-      where: { id: webhookEventId },
-      data: { status: "PROCESSING" },
-    });
-
-    const processor = getProcessor(webhookEvent.type);
-    if (processor) {
-      await processor(webhookEvent);
-    } else {
-      console.log(`[worker] no processor registered for ${webhookEvent.type} — acknowledging`);
-    }
-
-    await prisma.webhookEvent.update({
-      where: { id: webhookEventId },
-      data: { status: "PROCESSED", processedAt: new Date() },
-    });
-  },
+  (job: Job<WebhookJobData>) => handleWebhookEvent(job.data.webhookEventId),
   {
     connection: getQueueRedis(),
     // Backpressure: caps how many jobs run concurrently so a traffic spike

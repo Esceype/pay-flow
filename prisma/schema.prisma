@@ -52,6 +52,7 @@ model User {
 
   customers     Customer[]
   invoices      Invoice[]
+  subscriptions Subscription[]
   transactions  Transaction[]
   webhookEvents WebhookEvent[]
   revenueStats  MaterializedRevenueStats?
@@ -138,11 +139,28 @@ model Invoice {
 }
 
 enum SubscriptionStatus {
+  // Ours, not Stripe's: the row exists (intent-first) but the customer
+  // hasn't completed Checkout, so there is no Stripe subscription yet.
+  AWAITING_CHECKOUT
+  // The rest mirror Stripe's subscription.status one to one.
   INCOMPLETE
+  INCOMPLETE_EXPIRED // terminal: first payment never succeeded
+  TRIALING
   ACTIVE
   PAST_DUE
-  CANCELED
   UNPAID
+  PAUSED
+  CANCELED // terminal
+}
+
+// Mirrors Stripe's price.recurring.interval. PayFlow itself only creates
+// MONTH and YEAR; DAY and WEEK exist so a subscription edited in the
+// tenant's Stripe Dashboard can still be mirrored instead of failing.
+enum BillingInterval {
+  DAY
+  WEEK
+  MONTH
+  YEAR
 }
 
 model Subscription {
@@ -151,21 +169,58 @@ model Subscription {
   // Restrict for the same reason as Invoice.customer.
   customer   Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
 
-  stripeSubscriptionId String             @unique
-  status               SubscriptionStatus @default(INCOMPLETE)
-  currentPeriodEnd     DateTime?
+  // Denormalized tenant id (same reasoning as Transaction.userId): the
+  // subscription list and the MRR read model are both per tenant.
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Idempotency key of the create request, as on Invoice. ADR-006.
+  requestKey String @unique
+
+  // Null until Stripe creates the subscription, which only happens once
+  // the customer completes Checkout. Set by the worker from the first
+  // lifecycle event that carries our row id in its metadata. ADR-007.
+  stripeSubscriptionId    String? @unique
+  // The Checkout Session (mode: subscription) the customer subscribes
+  // through. Null only briefly, or if creating it failed (retryable).
+  stripeCheckoutSessionId String? @unique
+
+  status SubscriptionStatus @default(AWAITING_CHECKOUT)
+
+  // What is charged per billing period (unit amount × quantity), in cents.
+  // Written at creation and re-synced from every lifecycle event, since
+  // the tenant can change the price in their own Stripe Dashboard. These
+  // four fields are what the MRR read model (Phase 5) is computed from.
+  amount        Int
+  currency      String
+  interval      BillingInterval
+  intervalCount Int             @default(1)
+
+  // Platform fee in basis points (application_fee_percent on the Stripe
+  // subscription), snapshotted at creation like Invoice.applicationFeeAmount.
+  applicationFeeBps Int @default(0)
+
+  currentPeriodEnd  DateTime?
+  cancelAtPeriodEnd Boolean   @default(false)
+  canceledAt        DateTime?
 
   // Stripe's `event.created` timestamp of the last lifecycle event actually
   // applied to this row. BullMQ does not guarantee processing order across
   // concurrent jobs, so the worker compares an incoming event's timestamp
   // against this before writing — stale (out-of-order) events are discarded
   // instead of applied. Last-write-wins by event time, not processing time.
+  // ADR-007 covers the cases a timestamp alone can't decide.
   lastEventAt DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  transactions Transaction[]
+
   @@index([customerId])
+  // "This tenant's subscriptions in status X": the subscription list, and
+  // the MRR recomputation over a tenant's active subscriptions (Phase 5).
+  @@index([userId, status])
 }
 
 model Transaction {
@@ -176,11 +231,21 @@ model Transaction {
   userId String
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  // What the money was for: a one-time Invoice, or a billing period of a
+  // Subscription (a Stripe subscription invoice is recorded as a
+  // Transaction against the Subscription, never as one of our Invoice
+  // rows — ADR-007). At most one of the two is set.
   invoiceId String?
   invoice   Invoice? @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
 
+  subscriptionId String?
+  subscription   Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+
   // Originating Stripe event, kept for traceability/correlation — not a
   // uniqueness/idempotency guard by itself (that's WebhookEvent.stripeEventId).
+  // Deliberately not @unique: a partitioned table can only enforce
+  // uniqueness on keys that include the partition key (createdAt), so
+  // duplicate protection is done at write time instead — see ADR-007.
   stripeEventId String?
 
   // Free-form Stripe event type (e.g. "charge.succeeded", "charge.refunded")
