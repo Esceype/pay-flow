@@ -48,9 +48,11 @@ decisions: `docs/adr/`.
   (`/dashboard`, `/api/connect/*`) checks `auth()` itself instead.
 - Resend for transactional emails (sent via queue, not synchronously — not
   yet wired up, Phase 6)
-- Vitest for unit tests (idempotency/ordering logic) + integration tests on
-  the webhook endpoint (duplicate event delivery, concurrent lifecycle
-  events) — not yet set up, Phase 6
+- Vitest 5 (`vitest.config.mts`, two projects): `npm test` = unit tests of
+  pure logic next to the code (`src/**/*.test.ts`); `npm run
+  test:integration` = webhook route + worker processors against a real
+  Postgres (`test/integration/`, own `payflow_test` database, created and
+  migrated by `test/global-setup.ts`). See "Testing" below.
 - Docker Compose: postgres, redis, nextjs app, worker — 4 independent
   services (`docker-compose.yml`, `docker/Dockerfile.app`, `docker/Dockerfile.worker`)
 - Deploy (future): Vercel (app) + Railway or Render (worker + redis)
@@ -113,24 +115,49 @@ cross-system (Postgres+Redis) transaction, because it isn't:
    throwing BullMQ's `UnrecoverableError` (tenant mismatch, missing row)
    skips the remaining retries and is marked `FAILED` immediately.
 
-Registered processors (`src/worker/processors/index.ts`): `account.updated`,
-`account.application.deauthorized` (`account.ts`), and the four Checkout
-events `checkout.session.completed` / `.async_payment_succeeded` /
-`.async_payment_failed` / `.expired` (`checkout-session.ts` — invoice state
-machine, conditional-UPDATE transitions, tenant check; see ADR-006). A
-Checkout event for a session PayFlow didn't create (e.g. `stripe trigger`)
-no-ops. Every other event type is acknowledged (marked `PROCESSED`) without
-a processor — expected, not a gap, until later phases add handlers.
+The job handler itself is `src/worker/handle-webhook-event.ts` (`index.ts`
+only wires it into a BullMQ `Worker`) so tests can call it directly.
 
-## Ordering Guarantee (subscription lifecycle events)
-BullMQ does not guarantee processing order across concurrent jobs. For a
-given `stripeSubscriptionId`, compare the incoming Stripe `event.created`
-against `Subscription.lastEventAt` before applying — discard stale
-(out-of-order) events. Last-write-wins by event timestamp, not processing
-time. (Field already exists on `Subscription`; the comparison logic itself
-is Phase 4 work — do it as a conditional SQL UPDATE, not read-compare-write
-in JS.) Invoice transitions don't need timestamps: each is a conditional
-`UPDATE ... WHERE status = 'PENDING'` (ADR-006).
+Registered processors (`src/worker/processors/index.ts`):
+- `account.updated`, `account.application.deauthorized` (`account.ts`).
+- The four Checkout events `checkout.session.completed` /
+  `.async_payment_succeeded` / `.async_payment_failed` / `.expired`
+  (`checkout-session.ts` — invoice state machine, conditional-UPDATE
+  transitions, tenant check; ADR-006). Subscription-mode sessions are
+  ignored there on purpose.
+- `customer.subscription.created` / `.updated` / `.deleted` and
+  `invoice.paid` (`subscription.ts`; ADR-007).
+
+An event for an object PayFlow didn't create (a `stripe trigger` session, a
+subscription made in the tenant's own Stripe Dashboard) no-ops. Every other
+event type is acknowledged (marked `PROCESSED`) without a processor —
+expected, not a gap. `invoice.payment_failed` deliberately has none: the
+resulting `past_due` arrives as `customer.subscription.updated`.
+
+## Subscriptions (ADR-007 — read before touching `subscription.ts`)
+- Created intent-first like invoices: row in `AWAITING_CHECKOUT`, Checkout
+  Session in `mode: "subscription"`. Stripe creates the subscription only
+  when the customer completes Checkout, so the row id travels in
+  `subscription_data.metadata.payflowSubscriptionId`; the first event
+  processed (lifecycle event OR `invoice.paid`, order not guaranteed) links
+  `stripeSubscriptionId`. Metadata is tenant-editable → that lookup is
+  scoped to the event's tenant and to unlinked rows only.
+- **Ordering guard** (implemented): one conditional `UPDATE … WHERE status
+  NOT IN (terminal) AND (lastEventAt IS NULL OR lastEventAt < event.created)`.
+  Older event → discarded (still `PROCESSED`). Terminal states (`CANCELED`,
+  `INCOMPLETE_EXPIRED`) absorb: a terminal event always applies, and nothing
+  changes a terminal row. Same-second events can't be ordered by
+  `event.created` (1s resolution) → **tie → re-read the subscription from
+  Stripe**. The rule as a pure function: `decideOrdering()` in
+  `src/lib/subscription-state.ts`.
+- Subscription payments (`invoice.paid`) are `Transaction` rows with
+  `subscriptionId` — NEVER our `Invoice` rows (those are one-time,
+  Checkout-backed). No money moved (trial) → no Transaction.
+- **One writer for status**: "Cancel" only calls Stripe; the row turns
+  `CANCELED` when the worker processes `customer.subscription.deleted`.
+  Don't write subscription status from request handlers.
+- Invoice transitions don't need timestamps: each is a conditional
+  `UPDATE ... WHERE status = 'PENDING'` (ADR-006).
 
 ## Consistency Model
 - STRONG consistency: `Invoice`/`Subscription` status updates — synchronous
@@ -145,8 +172,18 @@ in JS.) Invoice transitions don't need timestamps: each is a conditional
    parameter. Implemented for the request handlers as **intent-first**
    (`src/lib/billing.ts`, ADR-006): write our row first, call Stripe with a
    key derived from the row id, then store the Stripe id. Plus a per-render
-   `requestKey` on the invoice form against double-submits. Any Stripe call
-   the worker makes in later phases must do the same.
+   `requestKey` on the invoice and subscription forms against
+   double-submits. Any Stripe write the worker makes must do the same.
+
+Inside the worker, a processor's effect must also survive the job running
+twice (crash after commit, before BullMQ acks). Two patterns in use:
+- a conditional state transition that guards the insert (invoice
+  `PENDING → PAID` + its `Transaction`), or
+- `claimWebhookEvent(tx, id)` (`src/worker/claim-webhook-event.ts`): flip the
+  `WebhookEvent` to `PROCESSED` in the same DB transaction as the effect,
+  and skip the effect if it was already flipped (`invoice.paid`).
+Not a unique constraint on `Transaction.stripeEventId` — partitioned tables
+can't enforce uniqueness without the partition key (ADR-007).
 
 ## Caching Strategy
 - Redis caches `MaterializedRevenueStats` per user with TTL (~30s) as a
@@ -176,11 +213,24 @@ in JS.) Invoice transitions don't need timestamps: each is a conditional
   capped via BullMQ's `concurrency` option (`WORKER_CONCURRENCY` env var,
   default 5) to create backpressure instead of overwhelming the database.
 
-## Testing Scope (minimal but explicit — do not skip when Phase 6 arrives)
-- Unit tests: idempotency check logic, ordering/staleness check logic.
-- Integration tests: webhook endpoint receiving a duplicate event (must not
-  double-process), and two out-of-order subscription lifecycle events (must
-  apply only the newer one).
+## Testing (set up in Phase 4 — keep it current, don't defer)
+- `npm test` — unit, no infra: `src/lib/billing.test.ts`,
+  `src/lib/subscription-state.test.ts` (ordering rule, Stripe → our status
+  mapping, both API payload shapes), `checkout-session.test.ts`.
+- `npm run test:integration` — needs `docker compose up -d postgres`. Real
+  Postgres because the guarantees under test live in SQL (conditional
+  UPDATEs, row locks). Only the queue is faked (to observe enqueues and
+  simulate Redis being down) and individual Stripe calls are spied.
+  Covers: duplicate webhook delivery (must not double-process), enqueue
+  failure → non-2xx → recovery, out-of-order / concurrent / same-second
+  subscription events, late update after cancellation, `invoice.paid`
+  before any lifecycle event, job re-run after commit, tenant isolation.
+- `npm run test:all` runs both. Also `npm run typecheck`, `npm run lint`.
+- The integration env is fixed in `vitest.config.mts` (never read from
+  `.env`), and `test/global-setup.ts` refuses any database whose name
+  doesn't end in `_test` — the tests TRUNCATE every table.
+- A new processor or a new guarantee gets a test in the same change. When
+  one is added, check the test fails with the guarantee removed.
 
 ## Build Order (confirm with me after each phase before proceeding)
 0. ✅ Docker Compose infra + Prisma schema + BullMQ skeleton + Bull Board
@@ -222,14 +272,27 @@ in JS.) Invoice transitions don't need timestamps: each is a conditional
    payment link". Local gotcha that cost time: the Stripe CLI must be logged
    into the same account (sandbox) as `STRIPE_SECRET_KEY`, otherwise
    `stripe listen` forwards nothing — pass `--api-key` (see README).
-4. Subscriptions + lifecycle webhooks through the same pipeline (+ ordering
-   guard, see above). Decide first how Stripe's subscription invoices relate
-   to our `Invoice` model (ADR-006, "Revisit before Phase 4").
-5. `MaterializedRevenueStats` read model + Redis caching + rate limiting
+4. ✅ (awaiting review) Subscriptions through the same pipeline (ADR-007):
+   `/dashboard/subscriptions` (create → Checkout link, cancel, discard
+   pending), lifecycle processors with the ordering guard + tie-break +
+   terminal states, `invoice.paid` → `Transaction` with the
+   idempotent-consumer claim, platform fee via `application_fee_percent`.
+   Test suite introduced here instead of Phase 6 (Vitest, 59 unit + 43
+   integration tests; each guarantee checked by removing it and watching a
+   test fail). Verified live against the Stripe sandbox with real events:
+   Checkout link create/reuse/discard, a real subscription paid with a test
+   card (`invoice.paid` deliberately delivered before
+   `customer.subscription.created`), cancellation applied only via the
+   webhook. Not yet done by hand: completing the subscription Checkout in a
+   browser.
+5. `MaterializedRevenueStats` read model + Redis caching + rate limiting.
+   Compute MRR by recomputing from a tenant's `Subscription` rows (amount,
+   interval, intervalCount, status), not by incrementing deltas — a
+   recompute is idempotent under job retries, an increment is not.
 6. Outbox relay for stuck `RECEIVED`/`PROCESSING` rows (closes ADR-001's
    gap), dead-letter queue UI with replay, graceful degradation if Redis is
    unavailable, structured logging with correlation IDs + `stripeAccountId`,
-   Resend emails via the queue, test suite
+   Resend emails via the queue (incl. payment-failed), CI running the tests
 7. ADR backfill (002 eventual consistency) + polished README + deploy
 
 ## Working style

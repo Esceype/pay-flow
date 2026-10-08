@@ -8,13 +8,19 @@ Architecture rationale and phased build plan:
 [`stripe-saas-senior-architecture-plan.md`](./stripe-saas-senior-architecture-plan.md).
 Individual decisions are recorded in [`docs/adr/`](./docs/adr/) as they're made.
 
-**Status: Phase 3 (customers + invoices) complete.**
-Phase 0 infra, Phase 1 auth + Connect onboarding, Phase 2 webhook pipeline
-(signature verification, idempotent outbox insert + enqueue, worker
-dispatch, retry/backoff, dead-letter status tracking) and Phase 3 —
-customers and invoices created on the tenant's connected account, paid via
-one-time Checkout Sessions, with the payment outcome applied by the worker
-from Stripe's webhooks (ADR-006). Next: Phase 4, subscriptions.
+**Status: Phase 4 (subscriptions) complete.**
+- Phase 0 — infra: Docker Compose, Prisma schema, BullMQ, Bull Board.
+- Phase 1 — auth + Stripe Connect onboarding.
+- Phase 2 — webhook pipeline: signature verification, idempotent outbox
+  insert + enqueue, worker dispatch, retry/backoff, dead-letter status.
+- Phase 3 — customers and one-time invoices on the tenant's connected
+  account, paid via Checkout, with the outcome applied by the worker from
+  Stripe's webhooks (ADR-006).
+- Phase 4 — subscriptions mirrored from Stripe's lifecycle events, safe
+  against out-of-order and duplicate processing (ADR-007), plus the test
+  suite.
+
+Next: Phase 5, the revenue read model, caching and rate limiting.
 
 ## Architecture at a glance
 
@@ -48,10 +54,10 @@ docker compose up -d --build
 - Worker health: http://localhost:3001/healthz
 - Bull Board: http://localhost:3001/admin/queues (Basic Auth: `BULL_BOARD_USER` / `BULL_BOARD_PASSWORD`)
 
-Apply the Prisma schema against the containerized Postgres:
+Apply the migrations to the containerized Postgres:
 
 ```bash
-npx prisma migrate dev
+npx prisma migrate deploy
 ```
 
 (Reads `DATABASE_URL` from `.env`, which points at `localhost:5433` — see
@@ -62,7 +68,7 @@ npx prisma migrate dev
 ```bash
 cp .env.example .env         # DATABASE_URL/REDIS_URL should point at localhost
 npm install
-npx prisma migrate dev
+npx prisma migrate deploy
 npm run dev                  # Next.js app
 npm run worker:dev           # in a second terminal — BullMQ worker + Bull Board
 ```
@@ -83,6 +89,12 @@ npm run worker:dev           # in a second terminal — BullMQ worker + Bull Boa
    `EXPIRED`) when the worker processes Stripe's webhook, never from the
    checkout redirect itself. Expired or failed invoices get a "New payment
    link".
+6. `/dashboard/subscriptions` — create a subscription (price, currency,
+   monthly or yearly) and share its Checkout link. It stays
+   `AWAITING CHECKOUT` until the customer subscribes; from then on its
+   status, renewals and cancellation mirror Stripe's lifecycle events.
+   "Cancel" asks Stripe to cancel — the row shows `CANCELED` once Stripe's
+   webhook confirms it.
 
 There is **no `proxy.ts` auth gate** — each protected route/page checks the
 session itself. See `docs/adr/004-auth-and-proxy-gate.md` for why (short
@@ -133,7 +145,9 @@ For a deployed environment, create the endpoint in the Dashboard with
 worker handles (`src/worker/processors/index.ts`): `account.updated`,
 `account.application.deauthorized`, `checkout.session.completed`,
 `checkout.session.async_payment_succeeded`,
-`checkout.session.async_payment_failed`, `checkout.session.expired`.
+`checkout.session.async_payment_failed`, `checkout.session.expired`,
+`customer.subscription.created`, `customer.subscription.updated`,
+`customer.subscription.deleted`, `invoice.paid`.
 
 ### End-to-end: connect, invoice, pay
 
@@ -159,6 +173,25 @@ worker handles (`src/worker/processors/index.ts`): `account.updated`,
    The same command recovers an event that was missed while no listener
    was running.
 
+### End-to-end: subscribe, renew, cancel
+
+1. `/dashboard/subscriptions` → pick a customer, a price, "Create
+   subscription"; open the Checkout link and subscribe with card
+   `4242 4242 4242 4242`.
+2. Within a moment the row turns `ACTIVE` with a "current period ends"
+   date, and the first payment exists as a `Transaction` linked to the
+   subscription (not as an invoice on `/dashboard/invoices`).
+3. "Cancel" → the page says the cancellation was sent; the row still reads
+   `ACTIVE` until Stripe's `customer.subscription.deleted` is processed,
+   then `CANCELED`.
+4. A subscription nobody completed Checkout for can be removed with
+   "Discard" — its Checkout Session is expired in Stripe first, so the
+   link can't be used afterwards.
+
+Resending the subscription's `invoice.paid` event
+(`stripe events resend <evt_id> --account <acct_id>`) is a duplicate
+delivery and must *not* add a second `Transaction`.
+
 To fire a Connect-scoped test event without a real checkout:
 `stripe trigger --stripe-account acct_... checkout.session.completed`. It
 reaches the worker and no-ops (`no Invoice for session ...`) — that session
@@ -168,6 +201,39 @@ Without the CLI, the endpoint can also be exercised with validly signed
 synthetic events via `Stripe.webhooks.generateTestHeaderString()` against
 `STRIPE_CONNECT_WEBHOOK_SECRET` — how the duplicate / concurrent /
 out-of-order scenarios were verified during development.
+
+## Tests
+
+```bash
+npm test                   # unit tests: pure logic, no infrastructure
+npm run test:integration   # webhook route + worker against a real Postgres
+npm run test:all           # both
+```
+
+The **unit tests** cover the rules that are pure functions: the
+subscription ordering decision, the mapping from Stripe's objects to ours
+(in both API payload shapes), amount parsing and platform-fee rounding, and
+which Checkout event means what for an invoice.
+
+The **integration tests** need `docker compose up -d postgres`. They create
+and migrate their own `payflow_test` database (and refuse to run against
+anything not named `*_test`), then drive the real webhook route handler and
+the worker's real job handler. Postgres is not mocked, because the
+guarantees being tested are SQL — conditional updates and row locks. The
+only fake is the queue. What they pin down:
+
+- a webhook delivered twice is stored once and processed once
+- a failed enqueue answers non-2xx, and Stripe's retry recovers it
+- subscription events processed out of order, concurrently, or within the
+  same second still converge on the right state
+- a late `updated` can't resurrect a canceled subscription
+- `invoice.paid` arriving before any lifecycle event still finds its
+  subscription
+- a job that runs again after its effects were committed writes nothing
+- one tenant's events can't reach another tenant's rows
+
+Each of these was checked the other way round too: remove the guarantee
+from the code, and the corresponding test fails.
 
 ## Port conflicts
 

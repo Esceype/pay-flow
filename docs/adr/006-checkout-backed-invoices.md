@@ -28,12 +28,12 @@ would hand most of that lifecycle to Stripe. The cost is handling things
 Invoicing would do for us — expiry, and async payment methods — which is
 covered below.
 
-**Revisit before Phase 4:** subscriptions produce Stripe `Invoice` objects
-(`invoice.paid`, `invoice.payment_failed`) no matter what. From then on,
-"invoice" means two different things in this codebase: our one-off
-`Invoice` rows and Stripe's subscription invoices. Phase 4 must name them
-apart (e.g. record subscription payments as `Transaction`s against the
-`Subscription`, not as `Invoice` rows).
+**Subscriptions (resolved in ADR-007):** subscriptions produce Stripe
+`Invoice` objects (`invoice.paid`, `invoice.payment_failed`) no matter
+what, so "invoice" could have ended up meaning two things in this codebase.
+It doesn't: a subscription payment is recorded as a `Transaction` against
+the `Subscription`, never as one of these `Invoice` rows. An `Invoice` here
+is always a one-time, Checkout-backed record.
 
 ### State machine (worker, `src/worker/processors/checkout-session.ts`)
 
