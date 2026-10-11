@@ -18,7 +18,7 @@ import {
   type Currency,
   type Interval,
 } from "@/lib/billing";
-import { requireOnboardedUser, TenantError } from "@/lib/tenant";
+import { authorizeTenantAction, redirectForTenantError } from "@/lib/tenant";
 
 const subscriptionSchema = z.object({
   customerId: z.string().min(1),
@@ -41,9 +41,9 @@ function linkRedirect(checkoutUrl: string): never {
 export async function createSubscription(formData: FormData) {
   let user;
   try {
-    user = await requireOnboardedUser();
+    user = await authorizeTenantAction();
   } catch (err) {
-    redirect(err instanceof TenantError && err.message === "not_authenticated" ? "/login" : "/dashboard");
+    redirectForTenantError(err, "/dashboard/subscriptions");
   }
 
   const parsed = subscriptionSchema.safeParse({
@@ -122,9 +122,9 @@ export async function createSubscription(formData: FormData) {
 export async function getSubscriptionLink(formData: FormData) {
   let user;
   try {
-    user = await requireOnboardedUser();
+    user = await authorizeTenantAction();
   } catch (err) {
-    redirect(err instanceof TenantError && err.message === "not_authenticated" ? "/login" : "/dashboard");
+    redirectForTenantError(err, "/dashboard/subscriptions");
   }
 
   const subscriptionId = formData.get("subscriptionId");
@@ -151,9 +151,9 @@ export async function getSubscriptionLink(formData: FormData) {
 export async function cancelSubscription(formData: FormData) {
   let user;
   try {
-    user = await requireOnboardedUser();
+    user = await authorizeTenantAction();
   } catch (err) {
-    redirect(err instanceof TenantError && err.message === "not_authenticated" ? "/login" : "/dashboard");
+    redirectForTenantError(err, "/dashboard/subscriptions");
   }
 
   const subscriptionId = formData.get("subscriptionId");
@@ -178,9 +178,9 @@ export async function cancelSubscription(formData: FormData) {
 export async function discardSubscription(formData: FormData) {
   let user;
   try {
-    user = await requireOnboardedUser();
+    user = await authorizeTenantAction();
   } catch (err) {
-    redirect(err instanceof TenantError && err.message === "not_authenticated" ? "/login" : "/dashboard");
+    redirectForTenantError(err, "/dashboard/subscriptions");
   }
 
   const subscriptionId = formData.get("subscriptionId");

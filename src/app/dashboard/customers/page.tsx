@@ -5,6 +5,7 @@ import { createCustomer, deleteCustomer } from "./actions";
 
 const ERROR_MESSAGES: Record<string, string> = {
   invalid_input: "Please provide a valid email.",
+  rate_limited: "Too many requests — please wait a moment and try again.",
   duplicate: "That email is already a customer.",
   create_failed: "Couldn't create the customer — please try again.",
   stripe_sync_pending:

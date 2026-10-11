@@ -55,7 +55,7 @@ model User {
   subscriptions Subscription[]
   transactions  Transaction[]
   webhookEvents WebhookEvent[]
-  revenueStats  MaterializedRevenueStats?
+  revenueStats  MaterializedRevenueStats[]
 }
 
 model Customer {
@@ -116,13 +116,13 @@ model Invoice {
   // exists) or if session creation failed — "Get payment link" retries it.
   stripeCheckoutSessionId String? @unique
 
-  status    InvoiceStatus @default(PENDING)
-  amountDue Int // cents
-  currency  String        @default("usd")
+  status               InvoiceStatus @default(PENDING)
+  amountDue            Int // cents
+  currency             String        @default("usd")
   // Platform fee (cents) taken from this payment via application_fee_amount
   // on the direct charge. Snapshotted at creation so a later fee-rate change
   // never rewrites what an existing invoice charged.
-  applicationFeeAmount Int @default(0)
+  applicationFeeAmount Int           @default(0)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -309,16 +309,34 @@ model WebhookEvent {
 }
 
 model MaterializedRevenueStats {
-  // Read model for the analytics dashboard (simplified CQRS: Transaction is
-  // the write model, this is the read model). One row per tenant, updated
-  // asynchronously by the worker after each processed transaction, and
-  // cached in Redis with TTL + explicit invalidation on top of this table.
-  userId String @id
-  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // Read model for the analytics dashboard (simplified CQRS: Subscription
+  // and Transaction are the write model, this is the read model). Derived
+  // data: every row can be rebuilt from those tables at any time, and is —
+  // the worker recomputes a tenant's rows from scratch after each event
+  // that can change them (src/worker/revenue-stats.ts), then drops the
+  // Redis cache entry sitting on top of this table. ADR-002.
+  //
+  // One row per tenant per currency: amounts in different currencies can't
+  // be added together, so each currency gets its own figures.
+  userId   String
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  currency String
 
-  mrr          Int   @default(0) // cents
-  churnRate    Float @default(0)
-  totalRevenue Int   @default(0) // cents, lifetime
+  // Monthly recurring revenue in cents: ACTIVE and PAST_DUE subscriptions,
+  // each normalized to a month (a yearly price counts as 1/12).
+  mrr                 Int    @default(0)
+  activeSubscriptions Int    @default(0)
+  // Share (0..1) of the subscriptions that were running 30 days ago and
+  // have been canceled since.
+  churnRate           Float  @default(0)
+  // Lifetime sum of Transaction.amount in cents. BigInt: a lifetime total
+  // is the one figure here that only ever grows, and Int tops out at
+  // about 21 million in a two-decimal currency.
+  totalRevenue        BigInt @default(0)
 
-  updatedAt DateTime @updatedAt
+  // When these figures were computed. The dashboard shows it, because the
+  // figures are eventually consistent by design.
+  computedAt DateTime
+
+  @@id([userId, currency])
 }

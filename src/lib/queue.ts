@@ -2,13 +2,24 @@ import { Queue } from "bullmq";
 import { getQueueRedis } from "./redis";
 
 export const QUEUE_NAMES = {
-  // Outbox target for Connect webhook events (payment-relevant). The
-  // platform endpoint's account.updated event does NOT go through this
-  // queue — it's handled synchronously (see ADR-003).
+  // Outbox target for every Stripe event received on the Connect webhook
+  // endpoint (ADR-001).
   webhookEvents: "webhook-events",
+  // Derived data: recomputing a tenant's MaterializedRevenueStats after an
+  // event that can change them (ADR-002). A separate queue so analytics
+  // work never sits in front of payment events, and vice versa.
+  revenueStats: "revenue-stats",
+} as const;
+
+export const REVENUE_STATS_JOBS = {
+  // data: { userId } — recompute one tenant's stats.
+  recompute: "recompute",
+  // No data — enqueue a recompute for every tenant (boot and nightly).
+  refreshAll: "refresh-all",
 } as const;
 
 let webhookEventsQueueInstance: Queue | undefined;
+let revenueStatsQueueInstance: Queue | undefined;
 
 // Lazy singleton for the same reason as getQueueRedis(): constructing a
 // Queue touches its Redis connection immediately, which must not happen at
@@ -26,6 +37,21 @@ export function getWebhookEventsQueue(): Queue {
       // Board; WebhookEvent is also marked FAILED) — losing a failed payment
       // webhook silently is not acceptable.
       removeOnFail: false,
+    },
+  }));
+}
+
+export function getRevenueStatsQueue(): Queue {
+  return (revenueStatsQueueInstance ??= new Queue(QUEUE_NAMES.revenueStats, {
+    connection: getQueueRedis(),
+    defaultJobOptions: {
+      attempts: 5,
+      backoff: { type: "exponential", delay: 2000 },
+      removeOnComplete: { age: 3600, count: 1000 },
+      // Unlike a webhook event, a failed recompute loses nothing: the stats
+      // are rebuilt from scratch by the next event or the nightly refresh.
+      // A week is enough to notice a recurring failure in Bull Board.
+      removeOnFail: { age: 7 * 24 * 3600 },
     },
   }));
 }

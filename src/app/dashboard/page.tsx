@@ -1,7 +1,11 @@
 import { redirect } from "next/navigation";
 import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
+import { getRevenueStats } from "@/lib/revenue-stats";
 import { syncConnectAccountStatus } from "@/lib/stripe-connect";
+
+const formatMoney = (cents: number, currency: string) =>
+  `${(cents / 100).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${currency.toUpperCase()}`;
 
 const CONNECT_ERROR_MESSAGES: Record<string, string> = {
   access_denied: "You declined to connect your Stripe account.",
@@ -52,6 +56,11 @@ export default async function DashboardPage({
     ? (CONNECT_ERROR_MESSAGES[params.connect_error] ?? "Something went wrong connecting Stripe.")
     : null;
 
+  // From the read model (Redis, then one indexed read of
+  // MaterializedRevenueStats) — this page never aggregates Subscription or
+  // Transaction itself. The worker keeps those figures current. ADR-002.
+  const revenue = await getRevenueStats(session.user.id);
+
   return (
     <main className="flex flex-col gap-6">
       <h1 className="text-2xl font-semibold">Dashboard</h1>
@@ -99,6 +108,44 @@ export default async function DashboardPage({
           </div>
         )}
       </section>
+
+      {(user.onboardingComplete || revenue.byCurrency.length > 0) && (
+        <section className="rounded border p-4">
+          <h2 className="font-medium">Revenue</h2>
+          {revenue.byCurrency.length === 0 ? (
+            <p className="mt-2 text-sm text-neutral-600">
+              No revenue yet — figures appear here after the first payment or subscription.
+            </p>
+          ) : (
+            <table className="mt-2 w-full text-left text-sm">
+              <thead>
+                <tr className="border-b text-neutral-500">
+                  <th className="py-2 font-medium">MRR</th>
+                  <th className="py-2 font-medium">Active subscriptions</th>
+                  <th className="py-2 font-medium">Churn (30 days)</th>
+                  <th className="py-2 font-medium">Total revenue</th>
+                </tr>
+              </thead>
+              <tbody>
+                {revenue.byCurrency.map((stats) => (
+                  <tr key={stats.currency} className="border-b">
+                    <td className="py-2 font-medium">{formatMoney(stats.mrr, stats.currency)}</td>
+                    <td className="py-2">{stats.activeSubscriptions}</td>
+                    <td className="py-2">{(stats.churnRate * 100).toFixed(1)}%</td>
+                    <td className="py-2">{formatMoney(stats.totalRevenue, stats.currency)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          <p className="mt-2 text-xs text-neutral-500">
+            Updated in the background after each payment or subscription change, so it can trail
+            the lists by a few seconds.
+            {revenue.computedAt &&
+              ` Computed ${revenue.computedAt.replace("T", " ").slice(0, 16)} UTC.`}
+          </p>
+        </section>
+      )}
 
       {user.onboardingComplete && (
         <p className="text-sm text-neutral-600">

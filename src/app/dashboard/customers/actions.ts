@@ -6,7 +6,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { stripe } from "@/lib/stripe";
 import { ensureStripeCustomer } from "@/lib/billing";
-import { requireOnboardedUser, TenantError } from "@/lib/tenant";
+import { authorizeTenantAction, redirectForTenantError } from "@/lib/tenant";
 
 const customerSchema = z.object({
   email: z.string().trim().toLowerCase().email(),
@@ -21,9 +21,9 @@ const customerSchema = z.object({
 export async function createCustomer(formData: FormData) {
   let user;
   try {
-    user = await requireOnboardedUser();
+    user = await authorizeTenantAction();
   } catch (err) {
-    redirect(err instanceof TenantError && err.message === "not_authenticated" ? "/login" : "/dashboard");
+    redirectForTenantError(err, "/dashboard/customers");
   }
 
   const parsed = customerSchema.safeParse({
@@ -67,9 +67,9 @@ export async function createCustomer(formData: FormData) {
 export async function deleteCustomer(formData: FormData) {
   let user;
   try {
-    user = await requireOnboardedUser();
+    user = await authorizeTenantAction();
   } catch (err) {
-    redirect(err instanceof TenantError && err.message === "not_authenticated" ? "/login" : "/dashboard");
+    redirectForTenantError(err, "/dashboard/customers");
   }
 
   const customerId = formData.get("customerId");

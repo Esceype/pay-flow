@@ -1,7 +1,14 @@
 import Link from "next/link";
+import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { AuthError } from "next-auth";
 import { signIn } from "@/lib/auth";
+import { clientAddress, consumeRateLimit, RATE_LIMITS } from "@/lib/rate-limit";
+
+const ERROR_MESSAGES: Record<string, string> = {
+  CredentialsSignin: "Invalid email or password.",
+  RateLimited: "Too many login attempts — please wait a minute and try again.",
+};
 
 export default async function LoginPage({
   searchParams,
@@ -14,6 +21,14 @@ export default async function LoginPage({
   async function login(formData: FormData) {
     "use server";
     const redirectTo = (formData.get("callbackUrl") as string) || "/dashboard";
+
+    // Per client address, checked before the (deliberately slow) password
+    // comparison: caps password guessing and the CPU it would cost.
+    const limit = await consumeRateLimit(RATE_LIMITS.login, clientAddress(await headers()));
+    if (!limit.allowed) {
+      redirect(`/login?error=RateLimited&callbackUrl=${encodeURIComponent(redirectTo)}`);
+    }
+
     try {
       await signIn("credentials", {
         email: formData.get("email"),
@@ -37,7 +52,7 @@ export default async function LoginPage({
       <h1 className="text-2xl font-semibold">Log in</h1>
       {params.error && (
         <p role="alert" className="rounded bg-red-50 px-3 py-2 text-sm text-red-700">
-          Invalid email or password.
+          {ERROR_MESSAGES[params.error] ?? ERROR_MESSAGES.CredentialsSignin}
         </p>
       )}
       <form action={login} className="flex flex-col gap-4">

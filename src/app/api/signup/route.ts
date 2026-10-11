@@ -2,6 +2,7 @@ import { z } from "zod";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { hashPassword } from "@/lib/password";
+import { clientAddress, consumeRateLimit, RATE_LIMITS } from "@/lib/rate-limit";
 
 const signupSchema = z.object({
   email: z.string().trim().toLowerCase().email(),
@@ -10,6 +11,17 @@ const signupSchema = z.object({
 });
 
 export async function POST(request: Request) {
+  // Before anything else, and before the password hash in particular:
+  // scrypt is expensive on purpose, which makes an unthrottled signup
+  // endpoint a cheap way to burn this server's CPU.
+  const limit = await consumeRateLimit(RATE_LIMITS.signup, clientAddress(request.headers));
+  if (!limit.allowed) {
+    return Response.json(
+      { error: "Too many signup attempts — please try again later." },
+      { status: 429, headers: { "Retry-After": String(limit.retryAfterSeconds) } }
+    );
+  }
+
   const body = await request.json().catch(() => null);
   const parsed = signupSchema.safeParse(body);
   if (!parsed.success) {

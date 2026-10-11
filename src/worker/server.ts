@@ -4,7 +4,7 @@ import { createBullBoard } from "@bull-board/api";
 import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
 import { ExpressAdapter } from "@bull-board/express";
 import { env } from "../lib/env";
-import { getWebhookEventsQueue } from "../lib/queue";
+import { getRevenueStatsQueue, getWebhookEventsQueue } from "../lib/queue";
 
 const ADMIN_BASE_PATH = "/admin/queues";
 
@@ -35,7 +35,10 @@ export function startAdminServer() {
   serverAdapter.setBasePath(ADMIN_BASE_PATH);
 
   createBullBoard({
-    queues: [new BullMQAdapter(getWebhookEventsQueue())],
+    queues: [
+      new BullMQAdapter(getWebhookEventsQueue()),
+      new BullMQAdapter(getRevenueStatsQueue()),
+    ],
     serverAdapter,
   });
 

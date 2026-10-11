@@ -14,7 +14,7 @@ import {
   toMinorUnits,
   type Currency,
 } from "@/lib/billing";
-import { requireOnboardedUser, TenantError } from "@/lib/tenant";
+import { authorizeTenantAction, redirectForTenantError } from "@/lib/tenant";
 
 const invoiceSchema = z.object({
   customerId: z.string().min(1),
@@ -37,9 +37,9 @@ function linkRedirect(checkoutUrl: string): never {
 export async function createInvoice(formData: FormData) {
   let user;
   try {
-    user = await requireOnboardedUser();
+    user = await authorizeTenantAction();
   } catch (err) {
-    redirect(err instanceof TenantError && err.message === "not_authenticated" ? "/login" : "/dashboard");
+    redirectForTenantError(err, "/dashboard/invoices");
   }
 
   const parsed = invoiceSchema.safeParse({
@@ -121,9 +121,9 @@ export async function createInvoice(formData: FormData) {
 export async function getInvoiceLink(formData: FormData) {
   let user;
   try {
-    user = await requireOnboardedUser();
+    user = await authorizeTenantAction();
   } catch (err) {
-    redirect(err instanceof TenantError && err.message === "not_authenticated" ? "/login" : "/dashboard");
+    redirectForTenantError(err, "/dashboard/invoices");
   }
 
   const invoiceId = formData.get("invoiceId");
