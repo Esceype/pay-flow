@@ -10,7 +10,7 @@ Architecture rationale and phased build plan:
 [`stripe-saas-senior-architecture-plan.md`](./stripe-saas-senior-architecture-plan.md).
 Individual decisions are recorded in [`docs/adr/`](./docs/adr/) as they're made.
 
-**Status: Phase 4 (subscriptions) complete.**
+**Status: Phase 5 (revenue read model, cache, rate limiting) complete.**
 - Phase 0 — infra: Docker Compose, Prisma schema, BullMQ, Bull Board.
 - Phase 1 — auth + Stripe Connect onboarding.
 - Phase 2 — webhook pipeline: signature verification, idempotent outbox
@@ -20,23 +20,44 @@ Individual decisions are recorded in [`docs/adr/`](./docs/adr/) as they're made.
   Stripe's webhooks (ADR-006).
 - Phase 4 — subscriptions mirrored from Stripe's lifecycle events, safe
   against out-of-order and duplicate processing (ADR-007), plus the test
-  suite.
+  suite and CI.
+- Phase 5 — MRR, churn and lifetime revenue as an asynchronously
+  maintained read model with a Redis cache in front (ADR-002), and
+  token-bucket rate limiting (ADR-008).
 
-Next: Phase 5, the revenue read model, caching and rate limiting.
+Next: Phase 6 — outbox relay, dead-letter UI, structured logging, emails.
 
 ## Architecture at a glance
 
 ```
 Next.js app  ──┐
                ├──▶ PostgreSQL (Prisma)
-               ├──▶ Redis db0 (BullMQ queue) / db1 (cache)
+               ├──▶ Redis db0 (BullMQ queues) / db1 (cache, rate limiter)
                └──▶ Stripe API (Connect, Checkout, Billing)
 
 Worker (separate Node.js process)
-  ├─ BullMQ Worker: consumes `webhook-events` queue
+  ├─ BullMQ Worker: `webhook-events`  — Stripe events → invoices,
+  │                                      subscriptions, transactions
+  ├─ BullMQ Worker: `revenue-stats`   — recomputes each tenant's revenue
+  │                                      read model after those change
   └─ Express admin server (:3001)
        ├─ /healthz            — unauthenticated, for container healthchecks
        └─ /admin/queues       — Bull Board, HTTP Basic Auth required
+```
+
+How the data moves, and what is allowed to lag:
+
+```
+Stripe ─▶ webhook route ─▶ WebhookEvent row ─▶ webhook-events queue
+                                                      │
+              strongly consistent ◀── worker: invoice / subscription status
+              (same transaction)             + Transaction
+                                                      │ signal (at least once)
+                                                      ▼
+              eventually consistent ◀── worker: recompute MaterializedRevenueStats
+              (seconds behind)                 └▶ delete the tenant's cache key
+
+dashboard ─▶ Redis (30s TTL) ─miss─▶ MaterializedRevenueStats (by primary key)
 ```
 
 Four independent services in Docker Compose: `postgres`, `redis`, `app`,
@@ -97,6 +118,16 @@ npm run worker:dev           # in a second terminal — BullMQ worker + Bull Boa
    status, renewals and cancellation mirror Stripe's lifecycle events.
    "Cancel" asks Stripe to cancel — the row shows `CANCELED` once Stripe's
    webhook confirms it.
+7. Back on `/dashboard`, the **Revenue** panel shows MRR, active
+   subscriptions, 30-day churn and lifetime revenue, per currency. These
+   come from a read model the worker recomputes in the background, so they
+   can trail the lists by a few seconds — the panel says when they were
+   computed.
+
+Dashboard actions are rate-limited per tenant (a burst of 20, then one
+every two seconds), and login and signup per client address; going over
+shows a "too many requests" message rather than an error page
+([ADR-008](./docs/adr/008-rate-limiting.md)).
 
 There is **no `proxy.ts` auth gate** — each protected route/page checks the
 session itself. See `docs/adr/004-auth-and-proxy-gate.md` for why (short
@@ -208,21 +239,28 @@ out-of-order scenarios were verified during development.
 
 ```bash
 npm test                   # unit tests: pure logic, no infrastructure
-npm run test:integration   # webhook route + worker against a real Postgres
+npm run test:integration   # webhook route + worker against real Postgres and Redis
 npm run test:all           # both
 ```
+
+CI ([`.github/workflows/ci.yml`](./.github/workflows/ci.yml)) runs lint,
+typecheck and both test suites on every push, then builds the app with the
+database URL removed — the Docker image is built without runtime
+environment variables, and that step keeps it possible
+([ADR-005](./docs/adr/005-lazy-env-and-client-init.md)).
 
 The **unit tests** cover the rules that are pure functions: the
 subscription ordering decision, the mapping from Stripe's objects to ours
 (in both API payload shapes), amount parsing and platform-fee rounding, and
 which Checkout event means what for an invoice.
 
-The **integration tests** need `docker compose up -d postgres`. They create
-and migrate their own `payflow_test` database (and refuse to run against
-anything not named `*_test`), then drive the real webhook route handler and
-the worker's real job handler. Postgres is not mocked, because the
-guarantees being tested are SQL — conditional updates and row locks. The
-only fake is the queue. What they pin down:
+The **integration tests** need `docker compose up -d postgres redis`. They
+create and migrate their own `payflow_test` database (and refuse to run
+against anything not named `*_test`) and use Redis logical database 15,
+then drive the real webhook route handler and the worker's real job
+handlers. Postgres and Redis are not mocked, because the guarantees being
+tested live there — conditional updates, row and advisory locks, a Lua
+script. The only fakes are the two job queues. What they pin down:
 
 - a webhook delivered twice is stored once and processed once
 - a failed enqueue answers non-2xx, and Stripe's retry recovers it
@@ -233,6 +271,15 @@ only fake is the queue. What they pin down:
   subscription
 - a job that runs again after its effects were committed writes nothing
 - one tenant's events can't reach another tenant's rows
+- revenue figures: MRR normalization, currencies kept apart, the churn
+  window, and that the same recompute run any number of times gives the
+  same rows
+- a recompute waits for another one of the same tenant, then reads what
+  was committed in the meantime
+- the dashboard shows new figures right after a recompute, not after the
+  cache TTL; with Redis unreachable it reads Postgres instead
+- the token bucket: burst, refill, cap, no token spent twice under
+  concurrency, and requests allowed when Redis is unreachable
 
 Each of these was checked the other way round too: remove the guarantee
 from the code, and the corresponding test fails.
@@ -293,8 +340,12 @@ for why that distinction mattered enough to be its own ADR.
   independent services that all need to react to the same event stream
   (e.g. a separate billing-analytics service, a separate notifications
   service), that's the point to introduce a real event log.
-- **Read replicas**: dashboard reads currently hit primary Postgres (behind
-  the Redis cache layer, see ADR-002 once written). If cached-dashboard
-  traffic outgrows what caching alone absorbs, a read replica for
-  `MaterializedRevenueStats` queries is the next lever, before reaching for
-  anything more drastic.
+- **Revenue stats rollups**: a tenant's stats are recomputed from scratch,
+  which costs time proportional to that tenant's history. Past roughly
+  100ms per recompute, the next step is per-period rollups — sum each
+  closed month once, recompute only the open one — which keeps the
+  recompute idempotent ([ADR-002](./docs/adr/002-eventual-consistency-analytics.md)).
+- **Read replicas**: dashboard reads currently hit primary Postgres behind
+  the Redis cache (ADR-002). If cached-dashboard traffic outgrows what
+  caching alone absorbs, a read replica for `MaterializedRevenueStats`
+  queries is the next lever, before reaching for anything more drastic.

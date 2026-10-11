@@ -32,10 +32,15 @@ decisions: `docs/adr/`.
     constructs `PrismaClient` with an explicit `@prisma/adapter-pg` driver
     adapter (runtime). Do not try to add `url = env("DATABASE_URL")` back
     into the datasource block — it will fail schema validation.
-- Redis (BullMQ job queue on logical db 0 + cache on logical db 1, same
-  instance — see `src/lib/redis.ts`)
-- BullMQ for event-driven webhook processing (separate worker process,
-  `src/worker/`)
+- Redis, one instance, two logical databases (`src/lib/redis.ts`): db 0 =
+  BullMQ queues, db 1 = cache + rate limiter. The two connections are
+  configured in opposite ways on purpose: the queue connection waits for
+  Redis (`maxRetriesPerRequest: null`, BullMQ requires it); the cache
+  connection fails within ~200ms, because nothing using it is essential to
+  a request. Use `getCacheRedis()` only for things that may be skipped.
+- BullMQ, separate worker process (`src/worker/`), two queues with one
+  `Worker` each: `webhook-events` (Stripe events, ADR-001) and
+  `revenue-stats` (derived analytics, ADR-002).
 - Bull Board for queue observability, served by the worker on its own port
   (`WORKER_HTTP_PORT`, default 3001) behind HTTP Basic Auth — the worker
   refuses to start without `BULL_BOARD_USER`/`BULL_BOARD_PASSWORD` set
@@ -50,9 +55,11 @@ decisions: `docs/adr/`.
   yet wired up, Phase 6)
 - Vitest 5 (`vitest.config.mts`, two projects): `npm test` = unit tests of
   pure logic next to the code (`src/**/*.test.ts`); `npm run
-  test:integration` = webhook route + worker processors against a real
-  Postgres (`test/integration/`, own `payflow_test` database, created and
-  migrated by `test/global-setup.ts`). See "Testing" below.
+  test:integration` = webhook route + worker against a real Postgres and a
+  real Redis (`test/integration/`; own `payflow_test` database created and
+  migrated by `test/global-setup.ts`, Redis logical db 15). See "Testing"
+  below. CI (`.github/workflows/ci.yml`) runs lint, typecheck, both test
+  projects and an env-free `next build` on every push.
 - Docker Compose: postgres, redis, nextjs app, worker — 4 independent
   services (`docker-compose.yml`, `docker/Dockerfile.app`, `docker/Dockerfile.worker`)
 - Deploy (future): Vercel (app) + Railway or Render (worker + redis)
@@ -162,9 +169,23 @@ resulting `past_due` arrives as `customer.subscription.updated`.
 ## Consistency Model
 - STRONG consistency: `Invoice`/`Subscription` status updates — synchronous
   within the worker's transaction before marking the job complete.
-- EVENTUAL consistency: analytics (MRR, churn) — separate read model
-  (`MaterializedRevenueStats`, keyed per `userId`), updated asynchronously
-  after each processed transaction.
+- EVENTUAL consistency: analytics (MRR, active subscriptions, 30-day churn,
+  lifetime revenue) — separate read model `MaterializedRevenueStats`, one
+  row per `(userId, currency)`. ADR-002. How it stays current:
+  - `handle-webhook-event.ts` enqueues a `recompute` job on the
+    `revenue-stats` queue after every event whose registry entry has
+    `affectsRevenue: true` (at-least-once: also on a re-run of an
+    already-`PROCESSED` event). A new processor that writes a `Transaction`
+    or changes a subscription must set that flag.
+  - `src/worker/revenue-stats.ts` is the ONLY writer of the table. It
+    **recomputes the tenant's rows from scratch** in SQL — never apply
+    deltas (not idempotent under retries) — inside a transaction holding a
+    per-tenant Postgres advisory lock, so concurrent recomputes can't
+    overwrite newer figures with older ones.
+  - A nightly job (and one at worker boot) recomputes every tenant: churn
+    is a sliding window, and this also repairs a lost signal.
+  - Request handlers and pages never aggregate `Subscription`/`Transaction`
+    for analytics; they call `getRevenueStats()` (`src/lib/revenue-stats.ts`).
 
 ## Idempotency (two layers — implement both)
 1. Inbound: `WebhookEvent.stripeEventId` unique constraint.
@@ -186,10 +207,15 @@ Not a unique constraint on `Transaction.stripeEventId` — partitioned tables
 can't enforce uniqueness without the partition key (ADR-007).
 
 ## Caching Strategy
-- Redis caches `MaterializedRevenueStats` per user with TTL (~30s) as a
-  safety net, AND explicit cache invalidation (`DEL`) triggered by the
-  worker on every new transaction affecting that user. Do not rely on TTL
-  alone. (Not yet implemented — Phase 5.)
+- Implemented (ADR-002): `getRevenueStats()` is cache-aside — Redis key
+  `revenue-stats:<userId>`, then the read-model table, then cache the
+  result (an empty result too). TTL 30s is the safety net; the freshness
+  mechanism is the explicit `DEL` the stats worker issues **after** its
+  recompute commits (deleting before the commit lets a reader re-cache old
+  rows). Do not rely on TTL alone.
+- `src/lib/cache.ts` wraps every cache operation so a Redis error becomes
+  a miss / a no-op, never a failed request. Every cache key must have a
+  TTL: the shared Redis runs `noeviction` for BullMQ's sake.
 
 ## Database Design Notes
 - `Transaction`: schema/indexes anticipate future
@@ -207,8 +233,13 @@ can't enforce uniqueness without the partition key (ADR-007).
   `prisma migrate deploy`.
 
 ## Rate Limiting / Backpressure
-- Public API routes: token bucket rate limiting per user. (Not yet
-  implemented — Phase 5.)
+- Implemented (ADR-008): token bucket in Redis, atomic via a Lua script
+  that uses Redis' own clock (`src/lib/rate-limit.ts`). Rules: tenant
+  mutations per user (burst 20, 1 per 2s), login and signup per client
+  address. **Fails open** if Redis is unreachable.
+- Every dashboard server action must start with `authorizeTenantAction()`
+  (`src/lib/tenant.ts`): signed in → within rate limit → onboarded, in that
+  order, and `redirectForTenantError(err, page)` in its catch block.
 - Webhook endpoint is never rate-limited on receipt; worker concurrency is
   capped via BullMQ's `concurrency` option (`WORKER_CONCURRENCY` env var,
   default 5) to create backpressure instead of overwhelming the database.
@@ -216,19 +247,29 @@ can't enforce uniqueness without the partition key (ADR-007).
 ## Testing (set up in Phase 4 — keep it current, don't defer)
 - `npm test` — unit, no infra: `src/lib/billing.test.ts`,
   `src/lib/subscription-state.test.ts` (ordering rule, Stripe → our status
-  mapping, both API payload shapes), `checkout-session.test.ts`.
-- `npm run test:integration` — needs `docker compose up -d postgres`. Real
-  Postgres because the guarantees under test live in SQL (conditional
-  UPDATEs, row locks). Only the queue is faked (to observe enqueues and
-  simulate Redis being down) and individual Stripe calls are spied.
+  mapping, both API payload shapes), `src/lib/rate-limit.test.ts`,
+  `checkout-session.test.ts`.
+- `npm run test:integration` — needs `docker compose up -d postgres redis`.
+  Real Postgres because the guarantees under test live in SQL (conditional
+  UPDATEs, row locks, the advisory lock, the stats aggregation); real Redis
+  because the rate limiter is a Lua script and the cache behaviour is the
+  thing under test. What is faked, for every test, in
+  `test/integration/setup.ts`: both BullMQ queues (`test/queues.ts` — to
+  observe enqueues, simulate Redis being down, and keep test jobs out of
+  any real queue), and `getCacheRedis()` is pointed at Redis logical db 15
+  (`test/redis.ts`). Stripe is never called; individual calls are spied.
   Covers: duplicate webhook delivery (must not double-process), enqueue
   failure → non-2xx → recovery, out-of-order / concurrent / same-second
   subscription events, late update after cancellation, `invoice.paid`
-  before any lifecycle event, job re-run after commit, tenant isolation.
+  before any lifecycle event, job re-run after commit, tenant isolation,
+  the stats recompute (MRR normalization, per-currency, churn window,
+  serialization on the tenant lock), the recompute signal, cache
+  invalidation and Redis-down fallbacks, the token bucket.
 - `npm run test:all` runs both. Also `npm run typecheck`, `npm run lint`.
 - The integration env is fixed in `vitest.config.mts` (never read from
   `.env`), and `test/global-setup.ts` refuses any database whose name
-  doesn't end in `_test` — the tests TRUNCATE every table.
+  doesn't end in `_test` — the tests TRUNCATE every table and FLUSHDB
+  Redis db 15.
 - A new processor or a new guarantee gets a test in the same change. When
   one is added, check the test fails with the guarantee removed.
 
@@ -272,7 +313,7 @@ can't enforce uniqueness without the partition key (ADR-007).
    payment link". Local gotcha that cost time: the Stripe CLI must be logged
    into the same account (sandbox) as `STRIPE_SECRET_KEY`, otherwise
    `stripe listen` forwards nothing — pass `--api-key` (see README).
-4. ✅ (awaiting review) Subscriptions through the same pipeline (ADR-007):
+4. ✅ Subscriptions through the same pipeline (ADR-007):
    `/dashboard/subscriptions` (create → Checkout link, cancel, discard
    pending), lifecycle processors with the ordering guard + tie-break +
    terminal states, `invoice.paid` → `Transaction` with the
@@ -283,17 +324,27 @@ can't enforce uniqueness without the partition key (ADR-007).
    Checkout link create/reuse/discard, a real subscription paid with a test
    card (`invoice.paid` deliberately delivered before
    `customer.subscription.created`), cancellation applied only via the
-   webhook. Not yet done by hand: completing the subscription Checkout in a
-   browser.
-5. `MaterializedRevenueStats` read model + Redis caching + rate limiting.
-   Compute MRR by recomputing from a tenant's `Subscription` rows (amount,
-   interval, intervalCount, status), not by incrementing deltas — a
-   recompute is idempotent under job retries, an increment is not.
+   webhook. Then reviewed and tested in the browser (subscribe through
+   Checkout, cancel, discard). CI added right after (GitHub Actions).
+5. ✅ (awaiting review) Revenue read model, cache and rate limiting
+   (ADR-002, ADR-008): `MaterializedRevenueStats` per `(userId, currency)`
+   recomputed from scratch by a second BullMQ worker (`revenue-stats`
+   queue) under a per-tenant advisory lock, triggered at-least-once after
+   revenue-affecting events, plus a nightly/boot refresh; cache-aside read
+   in Redis with TTL + explicit invalidation after commit; revenue panel on
+   `/dashboard`; token-bucket rate limiting (Lua) for tenant mutations,
+   login and signup, failing open. 137 tests (64 unit + 73 integration),
+   each new guarantee checked by removing it. Verified live: boot refresh
+   populated the read model to match the source tables; a real sandbox
+   subscription moved MRR 10.00 → 39.00 and back to 10.00 on cancel with
+   lifetime revenue staying put; cache key present with TTL; sixth signup
+   from one address answered 429 with `Retry-After`.
 6. Outbox relay for stuck `RECEIVED`/`PROCESSING` rows (closes ADR-001's
-   gap), dead-letter queue UI with replay, graceful degradation if Redis is
-   unavailable, structured logging with correlation IDs + `stripeAccountId`,
-   Resend emails via the queue (incl. payment-failed), CI running the tests
-7. ADR backfill (002 eventual consistency) + polished README + deploy
+   gap), dead-letter queue UI with replay, graceful degradation of the
+   webhook endpoint if Redis is unavailable, structured logging with
+   correlation IDs + `stripeAccountId`, Resend emails via the queue (incl.
+   payment-failed)
+7. Polished README + deploy (Vercel app, Railway/Render worker + Redis)
 
 ## Working style
 I have 4 years of full-stack experience and am comfortable reviewing code,
