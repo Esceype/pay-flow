@@ -32,6 +32,17 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      # Cache and rate limiter (a Lua script) are tested against the real
+      # thing, same major version as docker-compose.yml.
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
 
     env:
       # Credentials of the throwaway service container above — not secrets.
@@ -41,6 +52,7 @@ jobs:
       # create and migrate that database themselves (test/global-setup.ts).
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/payflow_test?schema=public
       TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/payflow_test?schema=public
+      TEST_REDIS_URL: redis://localhost:6379
       NEXT_TELEMETRY_DISABLED: 1
 
     steps:

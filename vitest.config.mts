@@ -6,21 +6,23 @@ import { defineConfig } from "vitest/config";
 //   unit         `npm test` — pure logic, no database, no network. Fast
 //                enough to run on every change.
 //   integration  `npm run test:integration` — the webhook route and the
-//                worker's processors against a real Postgres (the ordering
-//                and idempotency guarantees live in SQL, so mocking the
-//                database would test nothing). Needs `docker compose up -d
-//                postgres`; uses its own `payflow_test` database.
+//                worker against a real Postgres and a real Redis (the
+//                ordering and idempotency guarantees live in SQL, the rate
+//                limiter in a Lua script — mocking either would test
+//                nothing). Needs `docker compose up -d postgres redis`;
+//                uses its own `payflow_test` database and Redis db 15.
 
 // The whole environment the integration tests run in, fixed here rather
 // than read from .env: Vitest doesn't load .env into process.env, so the
 // tests can never reach the development database or a real Stripe key by
-// accident. Set TEST_DATABASE_URL to point at another Postgres (CI).
+// accident. Set TEST_DATABASE_URL / TEST_REDIS_URL to point elsewhere (CI).
 const integrationEnv = {
   DATABASE_URL:
     process.env.TEST_DATABASE_URL ??
     "postgresql://postgres:postgres@localhost:5433/payflow_test?schema=public",
-  // Never connected to: the tests replace the queue with a fake.
-  REDIS_URL: "redis://localhost:6379",
+  // Cache and rate limiter only, on logical db 15 (test/redis.ts). The
+  // queues are replaced with fakes, so no job ever reaches a real queue.
+  REDIS_URL: process.env.TEST_REDIS_URL ?? "redis://localhost:6379",
   // Only used for webhook signature math and mocked calls — no network.
   STRIPE_SECRET_KEY: "sk_test_integration_dummy",
   STRIPE_CONNECT_WEBHOOK_SECRET: "whsec_integration_test_secret",

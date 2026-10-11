@@ -61,7 +61,11 @@ export async function createSubscription(
     status?: SubscriptionStatus;
     lastEventAt?: Date;
     amount?: number;
+    currency?: string;
     interval?: BillingInterval;
+    intervalCount?: number;
+    createdAt?: Date;
+    canceledAt?: Date;
   } = {}
 ) {
   const n = next();
@@ -75,8 +79,38 @@ export async function createSubscription(
       status: overrides.status ?? "AWAITING_CHECKOUT",
       lastEventAt: overrides.lastEventAt,
       amount: overrides.amount ?? 2900,
-      currency: "usd",
+      currency: overrides.currency ?? "usd",
       interval: overrides.interval ?? "MONTH",
+      intervalCount: overrides.intervalCount,
+      createdAt: overrides.createdAt,
+      canceledAt: overrides.canceledAt,
+    },
+  });
+}
+
+// A subscription that exists in Stripe (linked), in the given status — the
+// starting point for anything computed *from* subscriptions.
+export async function createLinkedSubscription(
+  customer: { id: string; userId: string },
+  overrides: Omit<NonNullable<Parameters<typeof createSubscription>[1]>, "stripeSubscriptionId"> = {}
+) {
+  return createSubscription(customer, {
+    status: "ACTIVE",
+    ...overrides,
+    stripeSubscriptionId: `sub_test_${next()}`,
+  });
+}
+
+export async function createTransaction(
+  userId: string,
+  overrides: { amount?: number; currency?: string; type?: string } = {}
+) {
+  return prisma.transaction.create({
+    data: {
+      userId,
+      type: overrides.type ?? "invoice.paid",
+      amount: overrides.amount ?? 2900,
+      currency: overrides.currency ?? "usd",
     },
   });
 }

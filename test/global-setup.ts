@@ -1,4 +1,5 @@
 import { execSync } from "node:child_process";
+import { Redis } from "ioredis";
 import { Client } from "pg";
 import type { TestProject } from "vitest/node";
 
@@ -51,4 +52,20 @@ export default async function setup(project: TestProject) {
     env: { ...process.env, DATABASE_URL: databaseUrl },
     stdio: "pipe",
   });
+
+  // Fail here, with one clear message, rather than in every test that
+  // touches the cache or the rate limiter.
+  const redisUrl = project.config.env.REDIS_URL;
+  const redis = new Redis(redisUrl!, { maxRetriesPerRequest: 1, connectTimeout: 2000 });
+  redis.on("error", () => {});
+  try {
+    await redis.ping();
+  } catch (err) {
+    throw new Error(
+      `Integration tests need Redis at ${redisUrl} (start it with "docker compose up -d redis").`,
+      { cause: err }
+    );
+  } finally {
+    redis.disconnect();
+  }
 }

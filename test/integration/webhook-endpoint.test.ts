@@ -1,17 +1,17 @@
 import Stripe from "stripe";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { POST } from "@/app/api/webhooks/stripe-connect/route";
 import { prisma } from "@/lib/prisma";
 import { handleWebhookEvent } from "@/worker/handle-webhook-event";
 import { createCustomer, createInvoice, createTenant } from "../db";
+import { webhookEventsQueue } from "../queues";
 import { checkoutSession, stripeEvent, type TestStripeEvent } from "../stripe-events";
 
-// The queue is the one piece replaced with a fake: these tests are about
-// what the endpoint records and asks to have processed, and the fake lets
-// them see exactly that (and simulate Redis being down). Jobs are then run
-// through the worker's real handler.
-const { add } = vi.hoisted(() => ({ add: vi.fn() }));
-vi.mock("@/lib/queue", () => ({ getWebhookEventsQueue: () => ({ add }) }));
+// The queue is a fake (test/queues.ts): these tests are about what the
+// endpoint records and asks to have processed, and the fake lets them see
+// exactly that (and simulate Redis being down). Jobs are then run through
+// the worker's real handler.
+const { add } = webhookEventsQueue;
 
 const signer = new Stripe("sk_test_signer_only");
 
@@ -33,11 +33,6 @@ async function runEnqueuedJobs() {
     await handleWebhookEvent(data.webhookEventId);
   }
 }
-
-beforeEach(() => {
-  add.mockReset();
-  add.mockResolvedValue(undefined);
-});
 
 describe("POST /api/webhooks/stripe-connect", () => {
   it("stores the event against its tenant and enqueues it by row id", async () => {
