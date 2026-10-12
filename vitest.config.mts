@@ -29,6 +29,8 @@ const integrationEnv = {
   NEXTAUTH_SECRET: "integration-test-secret",
   NEXTAUTH_URL: "http://localhost:3000",
   PLATFORM_FEE_BPS: "250",
+  // Short, so the "Redis hangs" test doesn't take the production 2s.
+  WEBHOOK_ENQUEUE_TIMEOUT_MS: "300",
 };
 
 export default defineConfig({
@@ -56,6 +58,11 @@ export default defineConfig({
           env: integrationEnv,
           // One database shared by every file, truncated between tests.
           fileParallelism: false,
+          // The first test of each file also pays for opening the database
+          // and Redis connections; on a busy machine or CI runner that
+          // alone can pass the default 5s.
+          testTimeout: 20_000,
+          hookTimeout: 30_000,
         },
       },
     ],

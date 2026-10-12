@@ -116,11 +116,18 @@ export function subscriptionInvoice(fields: {
   stripeSubscriptionId: string;
   payflowSubscriptionId?: string;
   amountPaid?: number;
+  // For invoice.payment_failed:
+  amountDue?: number;
+  attemptCount?: number;
+  nextPaymentAttempt?: number | null;
 }) {
   return {
     id: fields.id,
     object: "invoice",
     amount_paid: fields.amountPaid ?? 2900,
+    amount_due: fields.amountDue ?? 2900,
+    attempt_count: fields.attemptCount ?? 1,
+    next_payment_attempt: fields.nextPaymentAttempt ?? null,
     currency: "usd",
     parent: {
       type: "subscription_details",

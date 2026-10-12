@@ -122,24 +122,48 @@ describe("POST /api/webhooks/stripe-connect", () => {
     expect(add).not.toHaveBeenCalled();
   });
 
-  it("answers non-2xx when the enqueue fails, and recovers on Stripe's retry", async () => {
+  it("accepts the event even when it can't be enqueued", async () => {
     const tenant = await createTenant();
     const event = stripeEvent("customer.created", { id: "cus_1" }, { account: tenant.stripeAccountId });
-    vi.spyOn(console, "error").mockImplementation(() => {});
     add.mockRejectedValueOnce(new Error("Redis is down"));
 
-    const failed = await deliver(event);
+    const response = await deliver(event);
 
-    // The row is durable even though nothing was queued; the non-2xx makes
-    // Stripe redeliver, which is the recovery path (ADR-001).
-    expect(failed.status).toBe(500);
+    // The row is the commitment: once it is stored the event is accepted,
+    // and the relay — not Stripe's retry schedule — gets it processed
+    // (ADR-001, amended; see relay.test.ts for that half).
+    expect(response.status).toBe(200);
+    const stored = await prisma.webhookEvent.findUniqueOrThrow({
+      where: { stripeEventId: event.id },
+    });
+    expect(stored.status).toBe("RECEIVED");
+  });
+
+  it("answers within the enqueue timeout when Redis doesn't respond at all", async () => {
+    const tenant = await createTenant();
+    const event = stripeEvent("customer.created", { id: "cus_1" }, { account: tenant.stripeAccountId });
+    // The queue's connection waits for Redis indefinitely; without a bound
+    // the request would hang with it until Stripe gave up.
+    add.mockReturnValueOnce(new Promise(() => {}));
+
+    const started = Date.now();
+    const response = await deliver(event);
+
+    expect(response.status).toBe(200);
+    // WEBHOOK_ENQUEUE_TIMEOUT_MS is 300 in the test environment.
+    expect(Date.now() - started).toBeLessThan(2000);
     expect(await prisma.webhookEvent.count()).toBe(1);
+  });
 
-    const retried = await deliver(event);
+  it("answers 5xx when the event can't be stored, so Stripe delivers it again", async () => {
+    const tenant = await createTenant();
+    const event = stripeEvent("customer.created", { id: "cus_1" }, { account: tenant.stripeAccountId });
+    vi.spyOn(prisma.webhookEvent, "create").mockRejectedValueOnce(new Error("database is down"));
 
-    expect(retried.status).toBe(200);
-    expect(await prisma.webhookEvent.count()).toBe(1);
-    expect(add).toHaveBeenCalledTimes(2);
+    // Nothing durable exists, so the event must not be acknowledged. (The
+    // route lets the error propagate; Next.js turns that into a 500.)
+    await expect(deliver(event)).rejects.toThrow("database is down");
+    expect(add).not.toHaveBeenCalled();
   });
 
   it("does not double-process a payment event that is delivered twice", async () => {

@@ -218,8 +218,11 @@ describe("the recompute signal from the webhook pipeline", () => {
       )
     );
 
+    // causedBy carries the event id along, so the recompute's logs join
+    // the event's.
     expect(revenueStatsQueue.add).toHaveBeenCalledExactlyOnceWith("recompute", {
       userId: tenant.id,
+      causedBy: expect.stringMatching(/^evt_/),
     });
   });
 
@@ -239,9 +242,10 @@ describe("the recompute signal from the webhook pipeline", () => {
       )
     );
 
-    expect(revenueStatsQueue.add).toHaveBeenCalledExactlyOnceWith("recompute", {
-      userId: tenant.id,
-    });
+    expect(revenueStatsQueue.add).toHaveBeenCalledExactlyOnceWith(
+      "recompute",
+      expect.objectContaining({ userId: tenant.id })
+    );
   });
 
   it("is not sent for events that can't change revenue", async () => {

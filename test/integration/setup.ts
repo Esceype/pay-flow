@@ -12,6 +12,8 @@ import { closeTestRedis, getTestRedis, resetRedis } from "../redis";
 //   Queues    fake (test/queues.ts): the tests assert on what was enqueued
 //             and run jobs through the handlers themselves.
 //   Stripe    never called; individual calls are spied where needed.
+//   Email     never sent: no API key is configured, so sendEmail() logs
+//             and reports "skipped" unless a test replaces it.
 
 vi.mock("@/lib/redis", async () => {
   const { getTestRedis } = await import("../redis");
@@ -25,11 +27,12 @@ vi.mock("@/lib/redis", async () => {
 
 vi.mock("@/lib/queue", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/queue")>();
-  const { webhookEventsQueue, revenueStatsQueue } = await import("../queues");
+  const queues = await import("../queues");
   return {
     ...actual,
-    getWebhookEventsQueue: () => webhookEventsQueue,
-    getRevenueStatsQueue: () => revenueStatsQueue,
+    getWebhookEventsQueue: () => queues.webhookEventsQueue,
+    getRevenueStatsQueue: () => queues.revenueStatsQueue,
+    getNotificationsQueue: () => queues.notificationsQueue,
   };
 });
 
