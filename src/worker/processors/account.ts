@@ -1,6 +1,7 @@
 import type Stripe from "stripe";
 import type { WebhookEvent } from "@prisma/client";
 import { UnrecoverableError } from "bullmq";
+import { log } from "../../lib/logger";
 import { syncConnectAccountStatus, unlinkConnectAccount } from "../../lib/stripe-connect";
 
 // account.updated for a connected account is a Connected-accounts scoped
@@ -13,7 +14,7 @@ export async function processAccountUpdated(webhookEvent: WebhookEvent): Promise
 
   const onboardingComplete = await syncConnectAccountStatus(stripeAccountId);
   if (onboardingComplete === null) {
-    console.warn(`[worker] account.updated: ${stripeAccountId} is not linked to any user — no-op`);
+    log.info("account.updated for an account not linked to any user");
   }
 }
 
@@ -28,6 +29,6 @@ export async function processAccountDeauthorized(webhookEvent: WebhookEvent): Pr
   if (!unlinked) {
     // Either the account isn't linked anymore, or the tenant reconnected
     // after this deauthorization happened — stale event, correctly ignored.
-    console.warn(`[worker] account.application.deauthorized: nothing to unlink for ${event.account}`);
+    log.info("deauthorization had nothing to unlink");
   }
 }

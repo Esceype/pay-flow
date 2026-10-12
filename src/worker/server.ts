@@ -4,14 +4,20 @@ import { createBullBoard } from "@bull-board/api";
 import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
 import { ExpressAdapter } from "@bull-board/express";
 import { env } from "../lib/env";
-import { getRevenueStatsQueue, getWebhookEventsQueue } from "../lib/queue";
+import { log } from "../lib/logger";
+import {
+  getNotificationsQueue,
+  getRevenueStatsQueue,
+  getWebhookEventsQueue,
+} from "../lib/queue";
+import { EVENTS_BASE_PATH, eventsRouter } from "./admin-events";
 
-const ADMIN_BASE_PATH = "/admin/queues";
+const QUEUES_BASE_PATH = "/admin/queues";
 
-// Bull Board must never be reachable without credentials — it exposes job
-// payloads, which can include Stripe event data. Fail loudly at startup
-// rather than silently serving it unauthenticated.
-function requireBullBoardCredentials() {
+// The admin pages must never be reachable without credentials — they expose
+// job payloads and Stripe event data. Fail loudly at startup rather than
+// silently serving them unauthenticated.
+function requireAdminCredentials() {
   if (!env.BULL_BOARD_USER || !env.BULL_BOARD_PASSWORD) {
     throw new Error(
       "BULL_BOARD_USER and BULL_BOARD_PASSWORD must be set — refusing to start the worker admin server without them."
@@ -21,7 +27,7 @@ function requireBullBoardCredentials() {
 }
 
 export function startAdminServer() {
-  const { user, password } = requireBullBoardCredentials();
+  const { user, password } = requireAdminCredentials();
 
   const app = express();
 
@@ -31,26 +37,32 @@ export function startAdminServer() {
     res.status(200).json({ status: "ok" });
   });
 
-  const serverAdapter = new ExpressAdapter();
-  serverAdapter.setBasePath(ADMIN_BASE_PATH);
+  // Everything under /admin: one gate, in front of both tools.
+  app.use("/admin", basicAuth({ users: { [user]: password }, challenge: true }));
 
+  // Jobs, per queue (Bull Board).
+  const serverAdapter = new ExpressAdapter();
+  serverAdapter.setBasePath(QUEUES_BASE_PATH);
   createBullBoard({
     queues: [
       new BullMQAdapter(getWebhookEventsQueue()),
       new BullMQAdapter(getRevenueStatsQueue()),
+      new BullMQAdapter(getNotificationsQueue()),
     ],
     serverAdapter,
+    options: {
+      uiConfig: { miscLinks: [{ text: "Webhook events & dead letters", url: EVENTS_BASE_PATH }] },
+    },
   });
+  app.use(QUEUES_BASE_PATH, serverAdapter.getRouter());
 
-  app.use(
-    ADMIN_BASE_PATH,
-    basicAuth({ users: { [user]: password }, challenge: true }),
-    serverAdapter.getRouter()
-  );
+  // Events, as durable rows: states, dead letters, replay (ADR-009).
+  app.use(EVENTS_BASE_PATH, eventsRouter());
 
   app.listen(env.WORKER_HTTP_PORT, () => {
-    console.log(
-      `[worker] admin server listening on :${env.WORKER_HTTP_PORT} (Bull Board at ${ADMIN_BASE_PATH}, auth required)`
-    );
+    log.info("admin server listening", {
+      port: env.WORKER_HTTP_PORT,
+      paths: [QUEUES_BASE_PATH, EVENTS_BASE_PATH],
+    });
   });
 }

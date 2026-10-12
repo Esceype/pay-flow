@@ -1,4 +1,5 @@
 import { getCacheRedis } from "./redis";
+import { log } from "./logger";
 
 // A cache that can only ever make a request faster, never make it fail.
 // Every operation swallows Redis errors (down, slow, misbehaving) and
@@ -13,7 +14,7 @@ export async function cacheGet<T>(key: string): Promise<T | null> {
     const raw = await getCacheRedis().get(key);
     return raw === null ? null : (JSON.parse(raw) as T);
   } catch (err) {
-    console.error(`[cache] get ${key} failed`, (err as Error).message);
+    log.warn("cache get failed, treating as a miss", { key, err });
     return null;
   }
 }
@@ -22,7 +23,7 @@ export async function cacheSet(key: string, value: unknown, ttlSeconds: number):
   try {
     await getCacheRedis().set(key, JSON.stringify(value), "EX", ttlSeconds);
   } catch (err) {
-    console.error(`[cache] set ${key} failed`, (err as Error).message);
+    log.warn("cache set failed", { key, err });
   }
 }
 
@@ -34,7 +35,7 @@ export async function cacheDelete(key: string): Promise<boolean> {
     await getCacheRedis().del(key);
     return true;
   } catch (err) {
-    console.error(`[cache] delete ${key} failed`, (err as Error).message);
+    log.warn("cache delete failed, entry lives until its TTL", { key, err });
     return false;
   }
 }

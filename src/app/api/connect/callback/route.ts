@@ -5,6 +5,7 @@ import { auth } from "@/lib/auth";
 import { stripe } from "@/lib/stripe";
 import { prisma } from "@/lib/prisma";
 import { env } from "@/lib/env";
+import { log } from "@/lib/logger";
 import { syncConnectAccountStatus } from "@/lib/stripe-connect";
 
 const STATE_COOKIE = "stripe_connect_state";
@@ -45,7 +46,7 @@ export async function GET(request: Request) {
     const tokenResponse = await stripe.oauth.token({ grant_type: "authorization_code", code });
     stripeAccountId = tokenResponse.stripe_user_id;
   } catch (err) {
-    console.error("[connect callback] token exchange failed", err);
+    log.error("connect: token exchange failed", { userId: session.user.id, err });
     return toDashboard("token_exchange_failed");
   }
 

@@ -1,9 +1,12 @@
 import { UnrecoverableError, Worker, type Job } from "bullmq";
 import { env } from "../lib/env";
-import { getQueueRedis } from "../lib/redis";
-import { prisma } from "../lib/prisma";
+import { log } from "../lib/logger";
 import { getRevenueStatsQueue, QUEUE_NAMES, REVENUE_STATS_JOBS } from "../lib/queue";
+import { getQueueRedis } from "../lib/redis";
+import { recordWebhookEventFailure } from "./dead-letter";
 import { handleWebhookEvent } from "./handle-webhook-event";
+import { handleNotificationJob } from "./notifications";
+import { startRelay } from "./relay";
 import { handleRevenueStatsJob } from "./revenue-stats";
 import { startAdminServer } from "./server";
 
@@ -11,7 +14,17 @@ interface WebhookJobData {
   webhookEventId: string;
 }
 
-const worker = new Worker(
+// True once BullMQ will not run the job again: every attempt used up, or
+// the handler threw UnrecoverableError (BullMQ skips the remaining retries
+// for those).
+function isFinalFailure(job: Job, err: Error): boolean {
+  const attemptsMax = job.opts.attempts ?? 1;
+  return err.name === UnrecoverableError.name || job.attemptsMade >= attemptsMax;
+}
+
+// 1. Stripe events -> our tables. The one queue where a lost or failed job
+//    is a lost payment, so its failures are recorded on the event itself.
+const webhookWorker = new Worker(
   QUEUE_NAMES.webhookEvents,
   (job: Job<WebhookJobData>) => handleWebhookEvent(job.data.webhookEventId),
   {
@@ -23,50 +36,65 @@ const worker = new Worker(
   }
 );
 
-worker.on("completed", (job) => {
-  console.log(`[worker] completed job ${job.id} (${job.name})`);
-});
-
-worker.on("failed", async (job, err) => {
-  console.error(`[worker] job ${job?.id} (${job?.name}) failed:`, err);
-
-  if (!job) return;
-
-  // Only mark the WebhookEvent FAILED once the job is actually dead: every
-  // retry attempt exhausted, or a processor threw UnrecoverableError
-  // (BullMQ skips the remaining retries for those). An intermediate failure
-  // still has retries coming (exponential backoff, src/lib/queue.ts) and
-  // should stay PROCESSING so it reads as "in flight," not "dead."
-  const attemptsMax = job.opts.attempts ?? 1;
-  const unrecoverable = err.name === UnrecoverableError.name;
-  if (!unrecoverable && job.attemptsMade < attemptsMax) return;
-
-  // Not if the event itself was already processed: then its effects are
-  // committed and only the follow-up revenue-stats signal failed — the
-  // nightly refresh repairs that, and the event did not fail.
+webhookWorker.on("failed", async (job, err) => {
+  if (!job) {
+    log.error("webhook job failed without a job reference", { err });
+    return;
+  }
   const { webhookEventId } = job.data as WebhookJobData;
-  await prisma.webhookEvent
-    .updateMany({
-      where: { id: webhookEventId, status: { not: "PROCESSED" } },
-      data: { status: "FAILED" },
-    })
-    .catch((updateErr) => {
-      console.error(`[worker] failed to mark WebhookEvent ${webhookEventId} as FAILED`, updateErr);
+  const final = isFinalFailure(job, err);
+
+  // The error itself, with the event's full context, was already logged by
+  // the handler. What only this listener knows is whether BullMQ is done
+  // with the job.
+  if (final) {
+    log.error("webhook event dead-lettered", {
+      queue: QUEUE_NAMES.webhookEvents,
+      webhookEventId,
+      eventType: job.name,
+      attempts: job.attemptsMade,
+      reason: err.message,
     });
+  }
+
+  // An intermediate failure keeps the event PROCESSING ("in flight") and
+  // only notes the error; the final one makes it a dead letter (ADR-009).
+  // If this write fails too, the relay reconciles the event with its job.
+  await recordWebhookEventFailure(webhookEventId, err, final).catch((recordErr) => {
+    log.error("could not record the webhook event failure", { webhookEventId, err: recordErr });
+  });
 });
 
-// Second consumer, own queue: derived analytics (ADR-002). Kept apart from
-// the webhook worker so a backlog of recomputes can never delay payment
-// events, and with a small fixed concurrency — recomputes for one tenant
-// serialize on a database lock anyway.
+// 2. Derived analytics (ADR-002). Kept apart from the webhook worker so a
+//    backlog of recomputes can never delay payment events, and with a small
+//    fixed concurrency — recomputes for one tenant serialize on a database
+//    lock anyway.
 const statsWorker = new Worker(QUEUE_NAMES.revenueStats, handleRevenueStatsJob, {
   connection: getQueueRedis(),
   concurrency: 2,
 });
 
-statsWorker.on("failed", (job, err) => {
-  console.error(`[worker] revenue stats job ${job?.id} (${job?.name}) failed:`, err);
-});
+// 3. Emails (ADR-010). The only worker that waits on a third party.
+const notificationsWorker = new Worker(
+  QUEUE_NAMES.notifications,
+  (job: Job<WebhookJobData>) => handleNotificationJob(job.data.webhookEventId),
+  { connection: getQueueRedis(), concurrency: 2 }
+);
+
+for (const [queue, worker] of [
+  [QUEUE_NAMES.revenueStats, statsWorker],
+  [QUEUE_NAMES.notifications, notificationsWorker],
+] as const) {
+  worker.on("failed", (job, err) => {
+    log.error(job && isFinalFailure(job, err) ? "job failed for good" : "job attempt failed", {
+      queue,
+      jobId: job?.id,
+      jobName: job?.name,
+      attempt: job?.attemptsMade,
+      err,
+    });
+  });
+}
 
 async function scheduleRevenueStatsRefresh() {
   const queue = getRevenueStatsQueue();
@@ -82,9 +110,14 @@ async function scheduleRevenueStatsRefresh() {
   await queue.add(REVENUE_STATS_JOBS.refreshAll, {});
 }
 
+// The outbox relay: on a plain timer, not a queue job — see relay.ts.
+const stopRelay = startRelay();
+
 async function shutdown(signal: string) {
-  console.log(`[worker] received ${signal}, shutting down...`);
-  await Promise.all([worker.close(), statsWorker.close()]);
+  log.info("worker shutting down", { signal });
+  stopRelay();
+  // close() lets jobs that are running finish before the process exits.
+  await Promise.all([webhookWorker.close(), statsWorker.close(), notificationsWorker.close()]);
   process.exit(0);
 }
 
@@ -93,11 +126,10 @@ process.on("SIGINT", () => void shutdown("SIGINT"));
 
 startAdminServer();
 scheduleRevenueStatsRefresh().catch((err) => {
-  console.error("[worker] could not schedule the revenue stats refresh", err);
+  log.error("could not schedule the revenue stats refresh", { err });
 });
 
-console.log(
-  "[worker] listening for jobs on queues:",
-  QUEUE_NAMES.webhookEvents,
-  QUEUE_NAMES.revenueStats
-);
+log.info("worker started", {
+  queues: Object.values(QUEUE_NAMES),
+  webhookConcurrency: env.WORKER_CONCURRENCY,
+});

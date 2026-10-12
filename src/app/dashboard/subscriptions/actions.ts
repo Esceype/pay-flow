@@ -5,6 +5,7 @@ import { redirect } from "next/navigation";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { env } from "@/lib/env";
+import { log } from "@/lib/logger";
 import {
   AMOUNT_PATTERN,
   BillingError,
@@ -93,7 +94,11 @@ export async function createSubscription(formData: FormData) {
     subscriptionId = subscription.id;
   } catch (err) {
     if (!(err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002")) {
-      console.error("[createSubscription] failed", err);
+      log.error("create subscription failed", {
+        action: "createSubscription",
+        userId: user.id,
+        err,
+      });
       redirect("/dashboard/subscriptions?error=create_failed");
     }
     // Same requestKey: this form was already submitted. Continue with the
@@ -112,7 +117,12 @@ export async function createSubscription(formData: FormData) {
   try {
     checkoutUrl = await getOrCreateSubscriptionLink(subscriptionId, user);
   } catch (err) {
-    console.error("[createSubscription] checkout link failed", err);
+    log.error("subscription saved but its checkout link failed", {
+      action: "createSubscription",
+      userId: user.id,
+      subscriptionId,
+      err,
+    });
     redirect("/dashboard/subscriptions?error=link_pending");
   }
 
@@ -139,7 +149,12 @@ export async function getSubscriptionLink(formData: FormData) {
     if (err instanceof BillingError) {
       redirect(`/dashboard/subscriptions?error=${err.message}`);
     }
-    console.error("[getSubscriptionLink] failed", err);
+    log.error("get subscription link failed", {
+      action: "getSubscriptionLink",
+      userId: user.id,
+      subscriptionId,
+      err,
+    });
     redirect("/dashboard/subscriptions?error=link_failed");
   }
 
@@ -167,7 +182,12 @@ export async function cancelSubscription(formData: FormData) {
     if (err instanceof BillingError) {
       redirect(`/dashboard/subscriptions?error=${err.message}`);
     }
-    console.error("[cancelSubscription] failed", err);
+    log.error("cancel subscription failed", {
+      action: "cancelSubscription",
+      userId: user.id,
+      subscriptionId,
+      err,
+    });
     redirect("/dashboard/subscriptions?error=cancel_failed");
   }
 
@@ -194,7 +214,12 @@ export async function discardSubscription(formData: FormData) {
     if (err instanceof BillingError) {
       redirect(`/dashboard/subscriptions?error=${err.message}`);
     }
-    console.error("[discardSubscription] failed", err);
+    log.error("discard subscription failed", {
+      action: "discardSubscription",
+      userId: user.id,
+      subscriptionId,
+      err,
+    });
     redirect("/dashboard/subscriptions?error=discard_failed");
   }
 

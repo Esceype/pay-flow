@@ -18,8 +18,15 @@ const envSchema = z.object({
   // Platform fee on each invoice payment, in basis points (250 = 2.5%),
   // taken via application_fee_amount on the direct charge. 0 disables it.
   PLATFORM_FEE_BPS: z.coerce.number().int().min(0).max(10_000).default(0),
+  // How long the webhook endpoint waits for Redis before answering Stripe
+  // anyway. The event is already durable in Postgres by then, and the relay
+  // delivers whatever wasn't enqueued (ADR-001, amended).
+  WEBHOOK_ENQUEUE_TIMEOUT_MS: z.coerce.number().int().positive().default(2000),
 
+  // Email (ADR-010). Without an API key, notifications are recorded and
+  // logged instead of sent — the app and the worker run fine without it.
   RESEND_API_KEY: z.string().optional(),
+  EMAIL_FROM: z.string().default("PayFlow <onboarding@resend.dev>"),
   // Required as of Phase 1: NEXTAUTH_SECRET signs session JWTs, and
   // NEXTAUTH_URL is the base URL used to build the Stripe Connect
   // redirect_uri (see src/lib/stripe-connect.ts).

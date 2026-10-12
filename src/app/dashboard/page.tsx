@@ -1,5 +1,6 @@
 import { redirect } from "next/navigation";
 import { auth } from "@/lib/auth";
+import { log } from "@/lib/logger";
 import { prisma } from "@/lib/prisma";
 import { getRevenueStats } from "@/lib/revenue-stats";
 import { syncConnectAccountStatus } from "@/lib/stripe-connect";
@@ -48,7 +49,7 @@ export default async function DashboardPage({
         (await syncConnectAccountStatus(user.stripeAccountId)) ?? user.onboardingComplete;
     } catch (err) {
       // Best effort — the stored flag is still a valid (if stale) answer.
-      console.error("[dashboard] Connect status read-repair failed", err);
+      log.warn("connect status read-repair failed", { userId: session.user.id, err });
     }
   }
 

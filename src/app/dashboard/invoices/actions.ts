@@ -4,6 +4,7 @@ import { z } from "zod";
 import { redirect } from "next/navigation";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
+import { log } from "@/lib/logger";
 import {
   AMOUNT_PATTERN,
   applicationFeeFor,
@@ -88,7 +89,7 @@ export async function createInvoice(formData: FormData) {
     invoiceId = invoice.id;
   } catch (err) {
     if (!(err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002")) {
-      console.error("[createInvoice] failed", err);
+      log.error("create invoice failed", { action: "createInvoice", userId: user.id, err });
       redirect("/dashboard/invoices?error=create_failed");
     }
     // Same requestKey: this form was already submitted (double-click, or a
@@ -107,7 +108,12 @@ export async function createInvoice(formData: FormData) {
   try {
     checkoutUrl = await getOrCreatePaymentLink(invoiceId, user);
   } catch (err) {
-    console.error("[createInvoice] payment link failed", err);
+    log.error("invoice saved but its payment link failed", {
+      action: "createInvoice",
+      userId: user.id,
+      invoiceId,
+      err,
+    });
     redirect("/dashboard/invoices?error=link_pending");
   }
 
@@ -138,7 +144,12 @@ export async function getInvoiceLink(formData: FormData) {
     if (err instanceof BillingError) {
       redirect(`/dashboard/invoices?error=${err.message}`);
     }
-    console.error("[getInvoiceLink] failed", err);
+    log.error("get invoice link failed", {
+      action: "getInvoiceLink",
+      userId: user.id,
+      invoiceId,
+      err,
+    });
     redirect("/dashboard/invoices?error=link_failed");
   }
 

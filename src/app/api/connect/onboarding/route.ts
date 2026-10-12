@@ -3,6 +3,7 @@ import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { stripe } from "@/lib/stripe";
 import { env } from "@/lib/env";
+import { log } from "@/lib/logger";
 
 // "Finish Stripe onboarding" for an account that is already linked but can't
 // accept charges yet (outstanding requirements). Re-running the OAuth flow
@@ -42,7 +43,7 @@ export async function GET() {
     // Stripe refuses Account Links for accounts the platform doesn't
     // control (a pre-existing Stripe account connected over OAuth): those
     // owners resolve requirements in their own Stripe Dashboard.
-    console.error("[connect onboarding] account link failed", err);
+    log.error("connect: account link failed", { userId: session.user.id, err });
     const url = new URL("/dashboard", env.NEXTAUTH_URL);
     url.searchParams.set("connect_error", "onboarding_link_failed");
     return NextResponse.redirect(url);

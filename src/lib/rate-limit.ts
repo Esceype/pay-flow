@@ -1,5 +1,6 @@
 import type { Redis } from "ioredis";
 import { getCacheRedis } from "./redis";
+import { log } from "./logger";
 
 // Token-bucket rate limiting in Redis (ADR-008).
 //
@@ -114,7 +115,7 @@ export async function consumeRateLimit(
       retryAfterSeconds: Math.ceil(retryAfterMs / 1000),
     };
   } catch (err) {
-    console.error(`[rate-limit] ${rule.name} unavailable, allowing request`, (err as Error).message);
+    log.warn("rate limiter unavailable, allowing request", { rule: rule.name, err });
     return { allowed: true, remaining: rule.capacity, retryAfterSeconds: 0 };
   }
 }

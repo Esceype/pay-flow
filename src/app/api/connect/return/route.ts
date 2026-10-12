@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { env } from "@/lib/env";
+import { log } from "@/lib/logger";
 import { syncConnectAccountStatus } from "@/lib/stripe-connect";
 
 // Where Stripe's hosted onboarding (/api/connect/onboarding) sends the
@@ -25,7 +26,7 @@ export async function GET() {
     try {
       await syncConnectAccountStatus(user.stripeAccountId);
     } catch (err) {
-      console.error("[connect return] status sync failed", err);
+      log.error("connect: status sync failed", { userId: session.user.id, err });
       dashboard.searchParams.set("connect_error", "status_sync_failed");
     }
   }

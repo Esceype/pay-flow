@@ -1,6 +1,7 @@
 import type Stripe from "stripe";
 import type { InvoiceStatus, WebhookEvent } from "@prisma/client";
 import { UnrecoverableError } from "bullmq";
+import { log } from "../../lib/logger";
 import { prisma } from "../../lib/prisma";
 
 // Invoices are our own records backed by a one-time Checkout Session
@@ -72,7 +73,7 @@ export async function processCheckoutSessionEvent(webhookEvent: WebhookEvent): P
     // A Checkout Session PayFlow didn't create (the tenant also uses their
     // Stripe account directly, or a `stripe trigger` test event) — nothing
     // of ours to update, and not an error.
-    console.warn(`[worker] ${event.type}: no Invoice for session ${session.id} — no-op`);
+    log.info("checkout event for a session PayFlow did not create", { sessionId: session.id });
     return;
   }
 
@@ -90,7 +91,7 @@ export async function processCheckoutSessionEvent(webhookEvent: WebhookEvent): P
 
   const outcome = checkoutOutcome(event.type, session.payment_status);
   if (outcome === "AWAITING_ASYNC_PAYMENT") {
-    console.log(`[worker] ${event.type}: invoice ${invoice.id} awaiting async payment — stays PENDING`);
+    log.info("invoice awaiting async payment, stays PENDING", { invoiceId: invoice.id });
     return;
   }
 

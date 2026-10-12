@@ -9,10 +9,15 @@ export const QUEUE_NAMES = {
   // event that can change them (ADR-002). A separate queue so analytics
   // work never sits in front of payment events, and vice versa.
   revenueStats: "revenue-stats",
+  // Emails to tenants (ADR-010). Its own queue because it talks to a third
+  // party: a slow or failing email provider must only ever back up emails.
+  // Job data: { webhookEventId } — the event the notification is about.
+  notifications: "notifications",
 } as const;
 
 export const REVENUE_STATS_JOBS = {
-  // data: { userId } — recompute one tenant's stats.
+  // data: { userId, causedBy? } — recompute one tenant's stats. causedBy is
+  // the Stripe event id that triggered it, for log correlation only.
   recompute: "recompute",
   // No data — enqueue a recompute for every tenant (boot and nightly).
   refreshAll: "refresh-all",
@@ -20,6 +25,7 @@ export const REVENUE_STATS_JOBS = {
 
 let webhookEventsQueueInstance: Queue | undefined;
 let revenueStatsQueueInstance: Queue | undefined;
+let notificationsQueueInstance: Queue | undefined;
 
 // Lazy singleton for the same reason as getQueueRedis(): constructing a
 // Queue touches its Redis connection immediately, which must not happen at
@@ -52,6 +58,23 @@ export function getRevenueStatsQueue(): Queue {
       // are rebuilt from scratch by the next event or the nightly refresh.
       // A week is enough to notice a recurring failure in Bull Board.
       removeOnFail: { age: 7 * 24 * 3600 },
+    },
+  }));
+}
+
+export function getNotificationsQueue(): Queue {
+  return (notificationsQueueInstance ??= new Queue(QUEUE_NAMES.notifications, {
+    connection: getQueueRedis(),
+    defaultJobOptions: {
+      // A longer first delay than the other queues: what fails here is
+      // usually the provider rate-limiting or briefly down, and hammering
+      // it doesn't help.
+      attempts: 5,
+      backoff: { type: "exponential", delay: 5000 },
+      removeOnComplete: { age: 3600, count: 1000 },
+      // Kept: an email that could not be sent is something to look at, and
+      // it can be retried from Bull Board without sending twice (ADR-010).
+      removeOnFail: false,
     },
   }));
 }

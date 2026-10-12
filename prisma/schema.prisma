@@ -56,6 +56,7 @@ model User {
   transactions  Transaction[]
   webhookEvents WebhookEvent[]
   revenueStats  MaterializedRevenueStats[]
+  notifications Notification[]
 }
 
 model Customer {
@@ -264,6 +265,10 @@ model Transaction {
   // two single-column indexes would force Postgres to intersect bitmaps
   // instead, which loses to the composite past a small row count.
   @@index([userId, createdAt])
+  // "Which payment did this Stripe event record?" — asked once per payment
+  // event when deciding whether to notify the tenant (ADR-010). Not unique,
+  // for the reason given on the column.
+  @@index([stripeEventId])
 }
 
 enum WebhookEventStatus {
@@ -304,8 +309,53 @@ model WebhookEvent {
   receivedAt  DateTime  @default(now())
   processedAt DateTime?
 
+  // Dead-letter details (ADR-009). lastError is the message of the most
+  // recent failed attempt — set while retries are still running too, and
+  // cleared once the event is processed. failedAt marks when it was given
+  // up on (retries exhausted, or an unrecoverable error).
+  lastError String?
+  failedAt  DateTime?
+
   @@index([userId, receivedAt])
-  @@index([status])
+  // Serves both operational queries: the relay's "RECEIVED or PROCESSING
+  // and older than N minutes, oldest first", and the dead-letter list's
+  // "FAILED, newest first". A status-only index would find the rows but
+  // then sort or filter them by time without help — and status alone has
+  // four values, which is not much of an index.
+  @@index([status, receivedAt])
+}
+
+enum NotificationStatus {
+  PENDING // recorded, not yet confirmed as handed to the email provider
+  SENT
+  SKIPPED // no email provider configured: logged instead of sent
+}
+
+// An email PayFlow decided to send to a tenant, written before the send is
+// attempted (ADR-010). It is the audit trail ("did we tell them?") and the
+// first of two duplicate guards: a job that runs twice finds the row.
+model Notification {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  kind String // "payment_received" | "subscription_payment_failed"
+
+  // What makes two notifications the same one: its kind plus the Stripe
+  // event that caused it. Also sent to the email provider as the
+  // idempotency key, which is the second duplicate guard.
+  dedupeKey String @unique
+
+  recipient String
+  subject   String
+
+  status            NotificationStatus @default(PENDING)
+  providerMessageId String?
+
+  createdAt DateTime  @default(now())
+  sentAt    DateTime?
+
+  @@index([userId, createdAt])
 }
 
 model MaterializedRevenueStats {

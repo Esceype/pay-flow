@@ -6,12 +6,18 @@ import { processSubscriptionEvent, processSubscriptionInvoicePaid } from "./subs
 type Processor = (webhookEvent: WebhookEvent) => Promise<void>;
 
 export interface Registration {
-  process: Processor;
+  // What the event changes in our own tables. Absent for an event that
+  // changes nothing by itself but still warrants a follow-up.
+  process?: Processor;
   // Set for events that can change what MaterializedRevenueStats is
   // computed from (a Transaction, or a subscription's status or price).
   // After such an event the worker asks for that tenant's stats to be
   // recomputed — see handle-webhook-event.ts and ADR-002.
   affectsRevenue?: true;
+  // Set for events the tenant may get an email about. Whether one is
+  // actually sent is decided later, from what the event left in the
+  // database — see src/worker/notifications.ts and ADR-010.
+  notifies?: true;
 }
 
 // Registry of handled Stripe event types. Anything not listed here is
@@ -26,10 +32,15 @@ export interface Registration {
 const registrations: Partial<Record<string, Registration>> = {
   "account.updated": { process: processAccountUpdated },
   "account.application.deauthorized": { process: processAccountDeauthorized },
-  "checkout.session.completed": { process: processCheckoutSessionEvent, affectsRevenue: true },
+  "checkout.session.completed": {
+    process: processCheckoutSessionEvent,
+    affectsRevenue: true,
+    notifies: true,
+  },
   "checkout.session.async_payment_succeeded": {
     process: processCheckoutSessionEvent,
     affectsRevenue: true,
+    notifies: true,
   },
   // Status-only for the invoice: no Transaction, so no revenue change.
   "checkout.session.async_payment_failed": { process: processCheckoutSessionEvent },
@@ -37,7 +48,10 @@ const registrations: Partial<Record<string, Registration>> = {
   "customer.subscription.created": { process: processSubscriptionEvent, affectsRevenue: true },
   "customer.subscription.updated": { process: processSubscriptionEvent, affectsRevenue: true },
   "customer.subscription.deleted": { process: processSubscriptionEvent, affectsRevenue: true },
-  "invoice.paid": { process: processSubscriptionInvoicePaid, affectsRevenue: true },
+  "invoice.paid": { process: processSubscriptionInvoicePaid, affectsRevenue: true, notifies: true },
+  // Nothing to write — the subscription's PAST_DUE arrives as
+  // customer.subscription.updated — but it is what the tenant is told about.
+  "invoice.payment_failed": { notifies: true },
 };
 
 export function getRegistration(eventType: string): Registration | undefined {

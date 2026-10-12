@@ -1,6 +1,7 @@
 import type { Prisma } from "@prisma/client";
 import type { Job } from "bullmq";
 import { prisma } from "../lib/prisma";
+import { log, withLogContext } from "../lib/logger";
 import { getRevenueStatsQueue, REVENUE_STATS_JOBS } from "../lib/queue";
 import { invalidateRevenueStatsCache } from "../lib/revenue-stats";
 
@@ -163,8 +164,17 @@ export async function enqueueRecomputeForAllTenants(): Promise<number> {
 export async function handleRevenueStatsJob(job: Job): Promise<void> {
   if (job.name === REVENUE_STATS_JOBS.refreshAll) {
     const enqueued = await enqueueRecomputeForAllTenants();
-    console.log(`[worker] revenue stats: refresh enqueued for ${enqueued} tenant(s)`);
+    log.info("revenue stats refresh enqueued", { tenants: enqueued });
     return;
   }
-  await recomputeRevenueStats((job.data as { userId: string }).userId);
+
+  // causedBy is the Stripe event that triggered this recompute. Logging
+  // under the same stripeEventId as the webhook route and the event's own
+  // job puts the recompute into that event's story.
+  const { userId, causedBy } = job.data as { userId: string; causedBy?: string };
+  await withLogContext({ userId, ...(causedBy && { stripeEventId: causedBy }) }, async () => {
+    const startedAt = Date.now();
+    await recomputeRevenueStats(userId);
+    log.info("revenue stats recomputed", { durationMs: Date.now() - startedAt });
+  });
 }

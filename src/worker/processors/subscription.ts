@@ -1,6 +1,7 @@
 import type Stripe from "stripe";
 import type { Subscription, WebhookEvent } from "@prisma/client";
 import { UnrecoverableError } from "bullmq";
+import { log } from "../../lib/logger";
 import { prisma } from "../../lib/prisma";
 import { stripe } from "../../lib/stripe";
 import {
@@ -97,7 +98,9 @@ export async function processSubscriptionEvent(webhookEvent: WebhookEvent): Prom
   if (!subscription) {
     // A subscription PayFlow didn't create (the tenant also uses their
     // Stripe account directly) — nothing of ours to update.
-    console.warn(`[worker] ${event.type}: no Subscription for ${stripeSubscription.id} — no-op`);
+    log.info("subscription event for a subscription PayFlow did not create", {
+      stripeSubscriptionId: stripeSubscription.id,
+    });
     return;
   }
 
@@ -142,10 +145,12 @@ export async function processSubscriptionEvent(webhookEvent: WebhookEvent): Prom
     // rather than silently dropping the event.
     throw new Error(`subscription ${subscription.id} changed while applying ${event.type}`);
   }
-  console.log(
-    `[worker] ${event.type}: discarded for subscription ${subscription.id} (${decision}; ` +
-      `event ${eventAt.toISOString()}, last applied ${current.lastEventAt?.toISOString() ?? "none"})`
-  );
+  log.info("subscription event discarded by the ordering guard", {
+    subscriptionId: subscription.id,
+    decision,
+    eventAt: eventAt.toISOString(),
+    lastAppliedAt: current.lastEventAt?.toISOString() ?? null,
+  });
 }
 
 // Tie-break for two events from the same second: ask Stripe what the
@@ -187,7 +192,9 @@ export async function processSubscriptionInvoicePaid(webhookEvent: WebhookEvent)
 
   const ref = subscriptionRefOfInvoice(invoice);
   if (!ref) {
-    console.log(`[worker] invoice.paid: ${invoice.id} is not a subscription invoice — no-op`);
+    log.info("invoice.paid for an invoice that is not from a subscription", {
+      stripeInvoiceId: invoice.id,
+    });
     return;
   }
 
@@ -197,13 +204,15 @@ export async function processSubscriptionInvoicePaid(webhookEvent: WebhookEvent)
     ref.payflowSubscriptionId
   );
   if (!subscription) {
-    console.warn(`[worker] invoice.paid: no Subscription for ${ref.stripeSubscriptionId} — no-op`);
+    log.info("invoice.paid for a subscription PayFlow did not create", {
+      stripeSubscriptionId: ref.stripeSubscriptionId,
+    });
     return;
   }
 
   if (invoice.amount_paid <= 0) {
     // Trial period or fully discounted: paid, but no money moved.
-    console.log(`[worker] invoice.paid: ${invoice.id} paid 0 — no Transaction`);
+    log.info("invoice.paid moved no money, no Transaction", { stripeInvoiceId: invoice.id });
     return;
   }
 

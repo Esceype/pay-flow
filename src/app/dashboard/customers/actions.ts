@@ -6,6 +6,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { stripe } from "@/lib/stripe";
 import { ensureStripeCustomer } from "@/lib/billing";
+import { log } from "@/lib/logger";
 import { authorizeTenantAction, redirectForTenantError } from "@/lib/tenant";
 
 const customerSchema = z.object({
@@ -47,7 +48,7 @@ export async function createCustomer(formData: FormData) {
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
       redirect("/dashboard/customers?error=duplicate");
     }
-    console.error("[createCustomer] failed", err);
+    log.error("create customer failed", { action: "createCustomer", userId: user.id, err });
     redirect("/dashboard/customers?error=create_failed");
   }
 
@@ -57,7 +58,12 @@ export async function createCustomer(formData: FormData) {
     // The customer is saved; only its Stripe counterpart is missing, and
     // ensureStripeCustomer() runs again (same idempotency key) before the
     // first invoice for it. Not worth failing the whole action over.
-    console.error("[createCustomer] Stripe sync failed, will retry on first invoice", err);
+    log.warn("customer saved but not yet created in Stripe", {
+      action: "createCustomer",
+      userId: user.id,
+      customerId: customer.id,
+      err,
+    });
     redirect("/dashboard/customers?error=stripe_sync_pending");
   }
 
@@ -102,7 +108,12 @@ export async function deleteCustomer(formData: FormData) {
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2003") {
       redirect("/dashboard/customers?error=has_invoices");
     }
-    console.error("[deleteCustomer] failed", err);
+    log.error("delete customer failed", {
+      action: "deleteCustomer",
+      userId: user.id,
+      customerId: customer.id,
+      err,
+    });
     redirect("/dashboard/customers?error=delete_failed");
   }
 
@@ -114,7 +125,12 @@ export async function deleteCustomer(formData: FormData) {
       // leaves an orphan Stripe customer with no invoices — harmless, so
       // logged rather than surfaced; our side is already consistent.
       if ((err as { code?: string }).code !== "resource_missing") {
-        console.error(`[deleteCustomer] Stripe customer ${customer.stripeCustomerId} not deleted`, err);
+        log.warn("customer deleted but its Stripe customer was not", {
+          action: "deleteCustomer",
+          userId: user.id,
+          stripeCustomerId: customer.stripeCustomerId,
+          err,
+        });
       }
     }
   }
