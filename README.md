@@ -10,7 +10,7 @@ Architecture rationale and phased build plan:
 [`stripe-saas-senior-architecture-plan.md`](./stripe-saas-senior-architecture-plan.md).
 Individual decisions are recorded in [`docs/adr/`](./docs/adr/) as they're made.
 
-**Status: Phase 5 (revenue read model, cache, rate limiting) complete.**
+**Status: Phase 6 (reliability and operations) complete.**
 - Phase 0 — infra: Docker Compose, Prisma schema, BullMQ, Bull Board.
 - Phase 1 — auth + Stripe Connect onboarding.
 - Phase 2 — webhook pipeline: signature verification, idempotent outbox
@@ -24,8 +24,12 @@ Individual decisions are recorded in [`docs/adr/`](./docs/adr/) as they're made.
 - Phase 5 — MRR, churn and lifetime revenue as an asynchronously
   maintained read model with a Redis cache in front (ADR-002), and
   token-bucket rate limiting (ADR-008).
+- Phase 6 — the outbox relay (events are accepted and processed even
+  through a Redis outage), dead letters with a reason and a replay button,
+  structured logs correlated by Stripe event id (ADR-009), and email
+  notifications sent at most once (ADR-010).
 
-Next: Phase 6 — outbox relay, dead-letter UI, structured logging, emails.
+Next: refunds and disputes, then deployment.
 
 ## Architecture at a glance
 
@@ -40,22 +44,30 @@ Worker (separate Node.js process)
   │                                      subscriptions, transactions
   ├─ BullMQ Worker: `revenue-stats`   — recomputes each tenant's revenue
   │                                      read model after those change
-  └─ Express admin server (:3001)
+  ├─ BullMQ Worker: `notifications`   — emails the tenant (Resend)
+  ├─ Outbox relay (timer)             — re-enqueues events that have no
+  │                                      job, reconciles the rest
+  └─ Express admin server (:3001), HTTP Basic Auth on /admin
        ├─ /healthz            — unauthenticated, for container healthchecks
-       └─ /admin/queues       — Bull Board, HTTP Basic Auth required
+       ├─ /admin/queues       — Bull Board: jobs, per queue
+       └─ /admin/events       — webhook events: states, dead letters, replay
 ```
 
 How the data moves, and what is allowed to lag:
 
 ```
-Stripe ─▶ webhook route ─▶ WebhookEvent row ─▶ webhook-events queue
-                                                      │
+Stripe ─▶ webhook route ─▶ WebhookEvent row ─ ─ ▶ webhook-events queue
+            answers 200 once        │   (fast path; if Redis is down the
+            the row is stored       │    relay enqueues it a minute later)
+                                    ▼
               strongly consistent ◀── worker: invoice / subscription status
               (same transaction)             + Transaction
-                                                      │ signal (at least once)
-                                                      ▼
-              eventually consistent ◀── worker: recompute MaterializedRevenueStats
-              (seconds behind)                 └▶ delete the tenant's cache key
+                                                      │ signals (at least once)
+                              ┌───────────────────────┴──────────────┐
+                              ▼                                      ▼
+   eventually consistent ◀── recompute                  email the tenant, once
+   (seconds behind)          MaterializedRevenueStats   (Notification row +
+                             └▶ delete the cache key     provider idempotency key)
 
 dashboard ─▶ Redis (30s TTL) ─miss─▶ MaterializedRevenueStats (by primary key)
 ```
@@ -75,7 +87,9 @@ docker compose up -d --build
 
 - App: http://localhost:3000
 - Worker health: http://localhost:3001/healthz
-- Bull Board: http://localhost:3001/admin/queues (Basic Auth: `BULL_BOARD_USER` / `BULL_BOARD_PASSWORD`)
+- Operator pages (Basic Auth: `BULL_BOARD_USER` / `BULL_BOARD_PASSWORD`):
+  - Bull Board, jobs per queue: http://localhost:3001/admin/queues
+  - Webhook events and dead letters: http://localhost:3001/admin/events
 
 Apply the migrations to the containerized Postgres:
 
@@ -180,7 +194,7 @@ worker handles (`src/worker/processors/index.ts`): `account.updated`,
 `checkout.session.async_payment_succeeded`,
 `checkout.session.async_payment_failed`, `checkout.session.expired`,
 `customer.subscription.created`, `customer.subscription.updated`,
-`customer.subscription.deleted`, `invoice.paid`.
+`customer.subscription.deleted`, `invoice.paid`, `invoice.payment_failed`.
 
 ### End-to-end: connect, invoice, pay
 
@@ -230,10 +244,47 @@ To fire a Connect-scoped test event without a real checkout:
 reaches the worker and no-ops (`no Invoice for session ...`) — that session
 wasn't created by PayFlow.
 
-Without the CLI, the endpoint can also be exercised with validly signed
-synthetic events via `Stripe.webhooks.generateTestHeaderString()` against
-`STRIPE_CONNECT_WEBHOOK_SECRET` — how the duplicate / concurrent /
-out-of-order scenarios were verified during development.
+### Without Stripe: signed synthetic events
+
+`scripts/send-test-event.mjs` sends an event signed with
+`STRIPE_CONNECT_WEBHOOK_SECRET`, which the endpoint verifies exactly as it
+would Stripe's. It carries no real Stripe object, so it exercises the
+pipeline rather than the business logic:
+
+```bash
+node scripts/send-test-event.mjs customer.created
+node scripts/send-test-event.mjs customer.created --id evt_same     # run twice: a duplicate
+node scripts/send-test-event.mjs account.application.deauthorized --no-account
+```
+
+The last one cannot be processed and becomes a **dead letter**.
+
+### Operating it: outages, dead letters, logs
+
+- **Redis down.** Stop it (`docker compose stop redis`) and send an event:
+  the endpoint still answers 200, about two seconds later, and the event
+  is stored as `RECEIVED`. Start Redis again and the event is processed —
+  by its own delayed enqueue if the app kept running, otherwise by the
+  relay, which re-enqueues events that have had no job for five minutes
+  ([ADR-001, amended](./docs/adr/001-outbox-pattern.md)).
+- **Dead letters.** http://localhost:3001/admin/events lists events that
+  could not be processed, each with its tenant and the reason, and a
+  Replay button. Replaying is always safe: every processor is idempotent
+  ([ADR-009](./docs/adr/009-dead-letters-and-observability.md)).
+- **Logs.** Both processes write one JSON object per line, and everything
+  logged while handling an event carries that event's `stripeEventId`:
+
+  ```bash
+  docker compose logs app worker | grep evt_1UPesxJExQH0uEllgOb3dfrn
+  ```
+
+  returns its receipt, its processing, the stats recompute it caused and
+  the notification about it.
+- **Emails.** A paid invoice or subscription, and a failed subscription
+  payment, notify the tenant by email, at most once per payment
+  ([ADR-010](./docs/adr/010-email-notifications.md)). Without a
+  `RESEND_API_KEY` nothing is sent: the notification is recorded as
+  `SKIPPED` and logged.
 
 ## Tests
 
@@ -251,8 +302,9 @@ environment variables, and that step keeps it possible
 
 The **unit tests** cover the rules that are pure functions: the
 subscription ordering decision, the mapping from Stripe's objects to ours
-(in both API payload shapes), amount parsing and platform-fee rounding, and
-which Checkout event means what for an invoice.
+(in both API payload shapes), amount parsing and platform-fee rounding,
+which Checkout event means what for an invoice, the logger's context
+propagation, and the email client's request and error classification.
 
 The **integration tests** need `docker compose up -d postgres redis`. They
 create and migrate their own `payflow_test` database (and refuse to run
@@ -260,10 +312,19 @@ against anything not named `*_test`) and use Redis logical database 15,
 then drive the real webhook route handler and the worker's real job
 handlers. Postgres and Redis are not mocked, because the guarantees being
 tested live there — conditional updates, row and advisory locks, a Lua
-script. The only fakes are the two job queues. What they pin down:
+script. The only fakes are the job queues and, where a test is about
+sending, the email provider. What they pin down:
 
 - a webhook delivered twice is stored once and processed once
-- a failed enqueue answers non-2xx, and Stripe's retry recovers it
+- an event is accepted with Redis down or hanging, then delivered by the
+  relay and processed exactly once; an event that can't be stored is not
+  accepted
+- the relay leaves in-flight events alone and marks an event failed when
+  its job failed for good but nobody recorded it
+- a dead letter keeps its reason, can be replayed once and only while it
+  is a dead letter, and a processed event is never marked failed
+- the tenant gets one email per payment however often the job runs, never
+  another tenant's, and none for a checkout that hasn't paid
 - subscription events processed out of order, concurrently, or within the
   same second still converge on the right state
 - a late `updated` can't resurrect a canceled subscription

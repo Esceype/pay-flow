@@ -38,12 +38,15 @@ decisions: `docs/adr/`.
   Redis (`maxRetriesPerRequest: null`, BullMQ requires it); the cache
   connection fails within ~200ms, because nothing using it is essential to
   a request. Use `getCacheRedis()` only for things that may be skipped.
-- BullMQ, separate worker process (`src/worker/`), two queues with one
-  `Worker` each: `webhook-events` (Stripe events, ADR-001) and
-  `revenue-stats` (derived analytics, ADR-002).
-- Bull Board for queue observability, served by the worker on its own port
-  (`WORKER_HTTP_PORT`, default 3001) behind HTTP Basic Auth — the worker
-  refuses to start without `BULL_BOARD_USER`/`BULL_BOARD_PASSWORD` set
+- BullMQ, separate worker process (`src/worker/`), three queues with one
+  `Worker` each: `webhook-events` (Stripe events, ADR-001), `revenue-stats`
+  (derived analytics, ADR-002) and `notifications` (emails, ADR-010). The
+  worker process also runs the outbox relay on a plain timer.
+- Operator pages served by the worker on its own port (`WORKER_HTTP_PORT`,
+  default 3001), everything under `/admin` behind HTTP Basic Auth — the
+  worker refuses to start without `BULL_BOARD_USER`/`BULL_BOARD_PASSWORD`:
+  Bull Board at `/admin/queues` (jobs) and `/admin/events` (webhook events
+  as rows: states, dead letters, replay — `src/worker/admin-events.ts`).
 - Stripe Connect (Standard accounts) + Checkout + Billing/Subscriptions + Webhooks
 - Auth.js (`next-auth@5`), Credentials provider (email+password), JWT
   sessions — see `docs/adr/004-auth-and-proxy-gate.md` for why this instead
@@ -51,8 +54,13 @@ decisions: `docs/adr/`.
   after it broke every request in Docker — `next-auth@5` beta predates
   Next 16's `middleware`→`proxy` rename). Every protected route
   (`/dashboard`, `/api/connect/*`) checks `auth()` itself instead.
-- Resend for transactional emails (sent via queue, not synchronously — not
-  yet wired up, Phase 6)
+- Resend for emails to tenants, as a plain `fetch` (`src/lib/email.ts`),
+  sent from the `notifications` queue, never from a request or from an
+  event's own job (ADR-010). No API key (or the `re_...` placeholder) →
+  notifications are recorded as `SKIPPED` and logged, nothing is sent.
+- Structured logging: `src/lib/logger.ts` — JSON lines, with a context
+  carried by `AsyncLocalStorage`. No `console.*` anywhere else in `src/`.
+  See "Logging" below.
 - Vitest 5 (`vitest.config.mts`, two projects): `npm test` = unit tests of
   pure logic next to the code (`src/**/*.test.ts`); `npm run
   test:integration` = webhook route + worker against a real Postgres and a
@@ -102,30 +110,49 @@ client added to `src/lib/` must follow the same pattern.
 
 ## Core Architectural Pattern: Transactional Outbox + Queue
 ✅ Implemented (`src/app/api/webhooks/stripe-connect/route.ts`,
-`src/worker/index.ts`, `src/worker/processors/`). Actual flow — and read
-`docs/adr/001-outbox-pattern.md` before assuming step 3 is a literal
-cross-system (Postgres+Redis) transaction, because it isn't:
+`src/worker/index.ts`, `src/worker/processors/`, `src/worker/relay.ts`).
+Actual flow — and read `docs/adr/001-outbox-pattern.md` (with its
+amendment) before assuming step 3 is a literal cross-system
+(Postgres+Redis) transaction, because it isn't:
 1. Verify Stripe Connect webhook signature
 2. Resolve `stripeAccountId` (`event.account`) → resolve owning `User`
 3. Insert into `WebhookEvent`, unique on `stripeEventId` (idempotency guard
-   — insert-first, catch `P2002` on duplicate, don't check-then-insert)
+   — insert-first, catch `P2002` on duplicate, don't check-then-insert).
+   **This insert is the commitment**: once the row exists the event is
+   accepted. A database error here propagates as a 5xx (nothing durable →
+   Stripe redelivers).
 4. Enqueue a BullMQ job onto `webhook-events`
    (`getWebhookEventsQueue().add(...)`) with `jobId = webhookEvent.id` — this
-   makes the *enqueue* idempotent independently of the DB insert
-5. Return 200 OK to Stripe immediately (before any business logic runs); a
-   failed enqueue returns non-200 on purpose, so Stripe's own retry becomes
-   the recovery path for that gap (ADR-001)
+   makes the *enqueue* idempotent independently of the DB insert. Best
+   effort, bounded by `WEBHOOK_ENQUEUE_TIMEOUT_MS` (the queue's Redis
+   connection would otherwise wait forever).
+5. Return 200 OK to Stripe (before any business logic runs) — **also when
+   the enqueue failed or timed out**. The earlier "non-200 so Stripe
+   retries" behaviour is gone (ADR-001 amendment).
 6. Worker (`src/worker/index.ts`) fetches the `WebhookEvent` row by id,
    dispatches to a per-type processor (`src/worker/processors/index.ts`),
-   marks `PROCESSED`. A job that exhausts all retries marks its
-   `WebhookEvent` `FAILED` via the Worker's `failed` listener. A processor
-   throwing BullMQ's `UnrecoverableError` (tenant mismatch, missing row)
-   skips the remaining retries and is marked `FAILED` immediately.
+   marks `PROCESSED`, then sends the follow-up signals (stats recompute,
+   notification). A processor throwing BullMQ's `UnrecoverableError`
+   (tenant mismatch, missing row) skips the remaining retries.
+7. **Relay** (`src/worker/relay.ts`, a plain `setInterval` in the worker —
+   deliberately not a BullMQ job): every minute, for events still
+   `RECEIVED`/`PROCESSING` after 5 minutes — no job → enqueue one; job
+   failed for good → mark the event `FAILED`; job in flight → leave it.
 
 The job handler itself is `src/worker/handle-webhook-event.ts` (`index.ts`
 only wires it into a BullMQ `Worker`) so tests can call it directly.
 
-Registered processors (`src/worker/processors/index.ts`):
+Dead letters (ADR-009, `src/worker/dead-letter.ts`): every failed attempt
+writes `WebhookEvent.lastError`; the final one also sets `FAILED` +
+`failedAt`; success clears both. Never mark a `PROCESSED` event failed (a
+job can fail after its event was processed, when only a follow-up signal
+couldn't be enqueued). Replay = conditional `FAILED → RECEIVED`, remove the
+old failed job, enqueue — safe because every processor is idempotent, so
+keep them that way.
+
+Registered event types (`src/worker/processors/index.ts`). Each entry is
+`{ process?, affectsRevenue?, notifies? }` — the two flags decide which
+follow-up signals `handle-webhook-event.ts` sends after the event is done:
 - `account.updated`, `account.application.deauthorized` (`account.ts`).
 - The four Checkout events `checkout.session.completed` /
   `.async_payment_succeeded` / `.async_payment_failed` / `.expired`
@@ -134,12 +161,36 @@ Registered processors (`src/worker/processors/index.ts`):
   ignored there on purpose.
 - `customer.subscription.created` / `.updated` / `.deleted` and
   `invoice.paid` (`subscription.ts`; ADR-007).
+- `invoice.payment_failed`: `{ notifies: true }` and no processor — it
+  changes nothing in our tables (the resulting `past_due` arrives as
+  `customer.subscription.updated`) but it is what the tenant is emailed
+  about.
 
 An event for an object PayFlow didn't create (a `stripe trigger` session, a
 subscription made in the tenant's own Stripe Dashboard) no-ops. Every other
 event type is acknowledged (marked `PROCESSED`) without a processor —
-expected, not a gap. `invoice.payment_failed` deliberately has none: the
-resulting `past_due` arrives as `customer.subscription.updated`.
+expected, not a gap.
+
+## Notifications (ADR-010)
+- `src/worker/notifications.ts`, on the `notifications` queue. Whether to
+  email is decided from the database, not the event: "payment received"
+  only if a `Transaction` exists for that `stripeEventId` (one email per
+  payment, not per "paid" event); "subscription payment failed" only for a
+  subscription the event's tenant owns. Recipient is always the tenant.
+- Sent at most once, two guards: a `Notification` row unique on
+  `kind:stripeEventId` written before sending, and the same key as the
+  provider's `Idempotency-Key`. Keep both when adding a notification kind.
+- Provider 5xx/429 → job retries; permanent 4xx → `UnrecoverableError`.
+
+## Logging
+- `log.info|warn|error(msg, fields)` from `src/lib/logger.ts`. `msg` is a
+  short stable string; variable data goes in `fields`; pass a caught error
+  as `err`. Never `console.*`.
+- Wrap each unit of work in `withLogContext({...})`; everything logged
+  underneath carries those fields. `stripeEventId` is the correlation id:
+  the webhook route, the event's job, the stats recompute it causes
+  (`causedBy` in the job data) and its notification all log under it.
+  `addLogContext()` adds a field once it becomes known (e.g. the tenant).
 
 ## Subscriptions (ADR-007 — read before touching `subscription.ts`)
 - Created intent-first like invoices: row in `AWAITING_CHECKOUT`, Checkout
@@ -248,23 +299,34 @@ can't enforce uniqueness without the partition key (ADR-007).
 - `npm test` — unit, no infra: `src/lib/billing.test.ts`,
   `src/lib/subscription-state.test.ts` (ordering rule, Stripe → our status
   mapping, both API payload shapes), `src/lib/rate-limit.test.ts`,
+  `src/lib/logger.test.ts`, `src/lib/email.test.ts`,
   `checkout-session.test.ts`.
 - `npm run test:integration` — needs `docker compose up -d postgres redis`.
   Real Postgres because the guarantees under test live in SQL (conditional
   UPDATEs, row locks, the advisory lock, the stats aggregation); real Redis
   because the rate limiter is a Lua script and the cache behaviour is the
   thing under test. What is faked, for every test, in
-  `test/integration/setup.ts`: both BullMQ queues (`test/queues.ts` — to
-  observe enqueues, simulate Redis being down, and keep test jobs out of
-  any real queue), and `getCacheRedis()` is pointed at Redis logical db 15
-  (`test/redis.ts`). Stripe is never called; individual calls are spied.
+  `test/integration/setup.ts`: the three BullMQ queues (`test/queues.ts` —
+  to observe enqueues, simulate Redis being down, and keep test jobs out of
+  any real queue; `fakeJob()` stands in for a job's state), and
+  `getCacheRedis()` is pointed at Redis logical db 15 (`test/redis.ts`).
+  Stripe is never called; individual calls are spied. No email is sent: no
+  API key is set, and `notifications.test.ts` replaces `sendEmail`.
   Covers: duplicate webhook delivery (must not double-process), enqueue
   failure → non-2xx → recovery, out-of-order / concurrent / same-second
   subscription events, late update after cancellation, `invoice.paid`
   before any lifecycle event, job re-run after commit, tenant isolation,
   the stats recompute (MRR normalization, per-currency, churn window,
   serialization on the tenant lock), the recompute signal, cache
-  invalidation and Redis-down fallbacks, the token bucket.
+  invalidation and Redis-down fallbacks, the token bucket, the endpoint
+  with Redis down or hanging, the relay's four cases, failure recording
+  and replay, the admin page (rendering, escaping, cross-site refusal),
+  and notifications (what is sent, to whom, exactly once).
+- Integration timeouts are raised (`testTimeout` 20s): the first test of a
+  file also pays for opening the DB/Redis connections, and under load that
+  alone passed the default 5s and failed unrelated tests.
+- `scripts/send-test-event.mjs` sends a signed synthetic event to the
+  running app — for exercising the pipeline by hand (dead letters, relay).
 - `npm run test:all` runs both. Also `npm run typecheck`, `npm run lint`.
 - The integration env is fixed in `vitest.config.mts` (never read from
   `.env`), and `test/global-setup.ts` refuses any database whose name
@@ -326,7 +388,7 @@ can't enforce uniqueness without the partition key (ADR-007).
    `customer.subscription.created`), cancellation applied only via the
    webhook. Then reviewed and tested in the browser (subscribe through
    Checkout, cancel, discard). CI added right after (GitHub Actions).
-5. ✅ (awaiting review) Revenue read model, cache and rate limiting
+5. ✅ Revenue read model, cache and rate limiting
    (ADR-002, ADR-008): `MaterializedRevenueStats` per `(userId, currency)`
    recomputed from scratch by a second BullMQ worker (`revenue-stats`
    queue) under a per-tenant advisory lock, triggered at-least-once after
@@ -339,12 +401,23 @@ can't enforce uniqueness without the partition key (ADR-007).
    subscription moved MRR 10.00 → 39.00 and back to 10.00 on cancel with
    lifetime revenue staying put; cache key present with TTL; sixth signup
    from one address answered 429 with `Retry-After`.
-6. Outbox relay for stuck `RECEIVED`/`PROCESSING` rows (closes ADR-001's
-   gap), dead-letter queue UI with replay, graceful degradation of the
-   webhook endpoint if Redis is unavailable, structured logging with
-   correlation IDs + `stripeAccountId`, Resend emails via the queue (incl.
-   payment-failed)
-7. Polished README + deploy (Vercel app, Railway/Render worker + Redis)
+6. ✅ (awaiting review) Reliability and operations: outbox relay + the
+   endpoint acknowledging once the row is stored (ADR-001 amendment); dead
+   letters with `lastError`, replay, and the `/admin/events` page;
+   structured logs correlated by `stripeEventId` (ADR-009); email
+   notifications on a third queue with two-layer de-duplication (ADR-010).
+   213 tests (90 unit + 123 integration), 12 guarantees checked by removing
+   them. Verified live: webhook during a real Redis outage → 200 in ~2.1s →
+   app restarted so its pending enqueue was lost → relay delivered it; an
+   unprocessable event → dead letter with its reason → replay → dead letter
+   again; cross-site POST to the admin page → 403; real sandbox events →
+   "payment received" and "subscription payment failed" notifications
+   recorded as `SKIPPED` (no API key locally). Not verified: an email
+   actually delivered by Resend.
+7. Refunds and disputes (own phase, agreed 2026-10-12): `charge.refunded` /
+   dispute events → negative `Transaction`s, invoice/subscription
+   consequences, lifetime revenue becoming net, a notification.
+8. Polished README + deploy (Vercel app, Railway/Render worker + Redis)
 
 ## Working style
 I have 4 years of full-stack experience and am comfortable reviewing code,

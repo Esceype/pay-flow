@@ -1,5 +1,12 @@
 # ADR-001: Transactional outbox for the Connect webhook pipeline
 
+> **Status: amended (2026-10-12).** The decision below chose option B —
+> answer non-2xx when the enqueue fails and let Stripe's retry recover — and
+> deferred the relay (option A) to a later phase. The relay now exists and
+> the endpoint behaves differently. See
+> [Amendment](#amendment-2026-10-12-the-relay-and-what-200-means-now) at the
+> end; the original text is kept as the record of the decision.
+
 ## Context
 
 Stripe times out and retries a webhook delivery if the endpoint doesn't
@@ -81,3 +88,64 @@ where "up to a few days of retries" isn't an acceptable recovery window.
   Bull Board (which already surfaces failed jobs since
   `removeOnFail: false`) and by querying `WebhookEvent` directly. A proper
   dead-letter UI beyond that is still Phase 6 scope.
+
+## Amendment (2026-10-12): the relay, and what "200" means now
+
+### What changed
+
+Option A — the outbox relay — is implemented (`src/worker/relay.ts`), and
+with it the endpoint's contract changed:
+
+- **The endpoint answers 200 as soon as the `WebhookEvent` row is stored**,
+  whether or not the job could be enqueued. The insert is the commitment;
+  the enqueue is only the fast path. The wait for Redis is bounded
+  (`WEBHOOK_ENQUEUE_TIMEOUT_MS`, 2s), because the queue's Redis connection
+  otherwise waits indefinitely and the request would hang with it.
+- A database error still propagates as a 5xx. Nothing durable exists, so
+  the event must not be acknowledged, and Stripe redelivers it.
+- **The relay delivers what has no job.** About once a minute it looks for
+  events still `RECEIVED` or `PROCESSING` after five minutes and compares
+  each with BullMQ:
+
+  | The event's job is… | The relay… |
+  |---|---|
+  | missing | enqueues one (same `jobId`, so it can't double up with the route) |
+  | waiting, active, or backing off | leaves it alone |
+  | failed for good | marks the event `FAILED` — the worker never got to record it |
+  | completed, though the event isn't processed | removes it and enqueues again |
+
+So the relay is a reconciler: Postgres says which events exist and in what
+state, Redis only holds pointers to them, and the relay makes the pointers
+match the rows after anything that separated them — Redis being down when
+the webhook arrived, the process dying between the two writes, or Redis
+losing its data.
+
+### Why this is better than relying on Stripe's retry
+
+- **Recovery time.** With option B an event waited for Stripe's next
+  attempt, which backs off from minutes to hours. Now it is processed
+  within about a minute of Redis coming back.
+- **Coverage.** Option B covered a failed enqueue. It did not cover a job
+  lost *after* a successful enqueue, since Stripe had already been told
+  200. The relay covers both.
+- **Endpoint health.** A Redis outage no longer shows up at Stripe as a
+  failing endpoint, which Stripe eventually disables.
+
+### Two design points
+
+- **The relay runs on a plain timer in the worker process, not as a BullMQ
+  job.** Something that exists to repair the queue shouldn't depend on the
+  queue's own scheduler surviving whatever broke the queue. Running it in
+  every worker replica is harmless: the enqueue is idempotent by `jobId`.
+- **The threshold is five minutes**, far beyond the ~30s a job's own
+  retries take, so a healthy event is never touched. A backlog longer than
+  that only costs the relay a lookup per waiting event.
+
+### What remains
+
+- The relay is bounded by the same thing as everything else: if Postgres
+  is down, the endpoint answers 5xx and Stripe's retry is the recovery
+  path again. That is the right failure — there is nowhere to record the
+  event.
+- Events are checked oldest first, 200 per run. An outage that strands
+  thousands of events is worked off over several minutes, not instantly.
