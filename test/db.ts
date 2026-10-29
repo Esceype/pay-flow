@@ -7,7 +7,7 @@ import { prisma } from "@/lib/prisma";
 
 export async function resetDatabase(): Promise<void> {
   await prisma.$executeRawUnsafe(
-    `TRUNCATE TABLE "Transaction", "Invoice", "Subscription", "Customer", "WebhookEvent", "Notification", "MaterializedRevenueStats", "User" CASCADE`
+    `TRUNCATE TABLE "Refund", "Transaction", "Invoice", "Subscription", "Customer", "WebhookEvent", "Notification", "MaterializedRevenueStats", "User" CASCADE`
   );
 }
 
@@ -112,5 +112,73 @@ export async function createTransaction(
       amount: overrides.amount ?? 2900,
       currency: overrides.currency ?? "usd",
     },
+  });
+}
+
+// Takes a row's lock the way a concurrent transaction would, and keeps it
+// until the returned function is called. Transactions started meanwhile
+// queue behind it in the order they reach the row — which turns a race
+// that only sometimes interleaves badly into one that always does.
+export async function holdRowLock(table: "Refund" | "Transaction", id: string) {
+  let release!: () => void;
+  const released = new Promise<void>((resolve) => (release = resolve));
+  let locked!: () => void;
+  const isLocked = new Promise<void>((resolve) => (locked = resolve));
+  const transaction = prisma.$transaction(
+    async (tx) => {
+      await tx.$queryRawUnsafe(`SELECT id FROM "${table}" WHERE id = $1 FOR UPDATE`, id);
+      locked();
+      await released;
+    },
+    { timeout: 15_000 }
+  );
+  await isLocked;
+  return async () => {
+    release();
+    await transaction;
+  };
+}
+
+export async function waitForLockWaiters(count: number) {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const [{ waiting }] = await prisma.$queryRaw<{ waiting: number }[]>`
+      SELECT count(*)::int AS waiting FROM pg_stat_activity
+      WHERE datname = current_database() AND wait_event_type = 'Lock'`;
+    if (waiting >= count) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(`expected ${count} transactions waiting on a lock`);
+}
+
+// A payment PayFlow recorded, as the worker leaves it: a paid one-time
+// invoice and its Transaction (the default), or a subscription payment.
+// `paymentIntent` stands for a payment intent already looked up and kept.
+export async function createPayment(
+  customer: { id: string; userId: string },
+  options: {
+    amount?: number;
+    via?: "invoice" | "subscription";
+    paymentIntent?: string;
+  } = {}
+) {
+  const amount = options.amount ?? 2000;
+  const source =
+    options.via === "subscription"
+      ? {
+          subscriptionId: (await createLinkedSubscription(customer, { amount })).id,
+          stripeInvoiceId: `in_test_${next()}`,
+        }
+      : { invoiceId: (await createInvoice(customer, { amountDue: amount, status: "PAID" })).id };
+
+  return prisma.transaction.create({
+    data: {
+      userId: customer.userId,
+      type: options.via === "subscription" ? "invoice.paid" : "checkout.session.completed",
+      amount,
+      currency: "usd",
+      stripePaymentIntentId: options.paymentIntent,
+      ...source,
+    },
+    include: { invoice: true },
   });
 }

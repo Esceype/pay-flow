@@ -357,7 +357,14 @@ describe("getRevenueStats (the cached read)", () => {
     const stats = await getRevenueStats(tenant.id);
 
     expect(stats.byCurrency).toEqual([
-      { currency: "usd", mrr: 2900, activeSubscriptions: 1, churnRate: 0, totalRevenue: 2900 },
+      {
+        currency: "usd",
+        mrr: 2900,
+        activeSubscriptions: 1,
+        churnRate: 0,
+        totalRevenue: 2900,
+        totalRefunds: 0,
+      },
     ]);
     expect(stats.computedAt).toEqual(expect.any(String));
   });

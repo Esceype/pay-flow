@@ -141,3 +141,25 @@ export function subscriptionInvoice(fields: {
     },
   };
 }
+
+export function stripeRefund(fields: {
+  id: string;
+  status: string;
+  amount?: number;
+  paymentIntent?: string;
+  // Our row id, as PayFlow puts it into the metadata of refunds it creates.
+  payflowRefundId?: string;
+  failureReason?: string;
+}) {
+  return {
+    id: fields.id,
+    object: "refund",
+    status: fields.status,
+    amount: fields.amount ?? 500,
+    currency: "usd",
+    payment_intent: fields.paymentIntent ?? "pi_test_1",
+    charge: "ch_test_1",
+    failure_reason: fields.failureReason ?? null,
+    metadata: fields.payflowRefundId ? { payflowRefundId: fields.payflowRefundId } : {},
+  };
+}
