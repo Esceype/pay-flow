@@ -165,6 +165,7 @@ follow-up signals `handle-webhook-event.ts` sends after the event is done:
   changes nothing in our tables (the resulting `past_due` arrives as
   `customer.subscription.updated`) but it is what the tenant is emailed
   about.
+- `refund.created` / `.updated` / `.failed` (`refund.ts`; ADR-011).
 
 An event for an object PayFlow didn't create (a `stripe trigger` session, a
 subscription made in the tenant's own Stripe Dashboard) no-ops. Every other
@@ -176,10 +177,14 @@ expected, not a gap.
   email is decided from the database, not the event: "payment received"
   only if a `Transaction` exists for that `stripeEventId` (one email per
   payment, not per "paid" event); "subscription payment failed" only for a
-  subscription the event's tenant owns. Recipient is always the tenant.
-- Sent at most once, two guards: a `Notification` row unique on
-  `kind:stripeEventId` written before sending, and the same key as the
-  provider's `Idempotency-Key`. Keep both when adding a notification kind.
+  subscription the event's tenant owns; "refund failed" only for a refund
+  of the event's tenant that is `FAILED` now. Recipient is always the
+  tenant.
+- Sent at most once, two guards: a `Notification` row unique on its
+  `dedupeKey` written before sending, and the same key as the provider's
+  `Idempotency-Key`. Keep both when adding a notification kind. The key is
+  `kind:stripeEventId`, except `refund_failed:<stripe refund id>` — Stripe
+  reports one refund failure with two events.
 - Provider 5xx/429 → job retries; permanent 4xx → `UnrecoverableError`.
 
 ## Logging
@@ -217,12 +222,45 @@ expected, not a gap.
 - Invoice transitions don't need timestamps: each is a conditional
   `UPDATE ... WHERE status = 'PENDING'` (ADR-006).
 
+## Refunds (ADR-011 — read before touching `refunds.ts` / `refund.ts`)
+- `Refund` row per refund, pointing at the payment (`Transaction`) it
+  refunds. Status mirrors Stripe, **one writer: the worker**. The request
+  (`src/lib/refunds.ts`) never stores the status from Stripe's response;
+  its only status write is `FAILED` when Stripe rejects the request with a
+  permanent 4xx (no refund exists, no event will come).
+- Request = intent-first: lock the payment row (`SELECT … FOR UPDATE`),
+  check `refundableAmount()` (pending refunds count as spent), insert
+  `PENDING` (+ unique `requestKey` against double submits), then
+  `refunds.create` with idempotency key `refund-<row id>`, metadata
+  `payflowRefundId`, `refund_application_fee: true`. No answer from Stripe
+  → row stays `PENDING` unlinked (still holding the amount); "Retry"
+  resends under the same key.
+- States are a DAG (`src/lib/refund-state.ts`): PENDING → SUCCEEDED →
+  FAILED, PENDING → FAILED | CANCELED. Forward step or ignore — no
+  timestamps needed. `applyStatus` locks the refund row **before** reading
+  its status: the ledger entry depends on the from-state.
+- Ledger is append-only, signed `Transaction`s with `refundId`: −amount
+  (`refund`) on PENDING → SUCCEEDED, +amount (`refund_reversal`) on
+  SUCCEEDED → FAILED, written in the same transaction as the transition.
+  Payments are rows with `refundId IS NULL AND amount > 0` — filter on
+  that wherever "payments" are meant.
+- Payment intents aren't in the payment webhooks (API 2026-07-29):
+  `src/lib/payment-intents.ts` looks them up on first refund (Checkout
+  Session / `invoicePayments.list`) and caches `stripePaymentIntentId` on
+  the `Transaction`; the reverse lookup mirrors refunds made in the
+  tenant's Stripe Dashboard (row with `requestKey = null`).
+- Metadata is tenant-editable → linking by `payflowRefundId` is scoped to
+  the event's tenant and unlinked rows. A refund doesn't change the
+  invoice (stays `PAID`) or the subscription.
+
 ## Consistency Model
-- STRONG consistency: `Invoice`/`Subscription` status updates — synchronous
-  within the worker's transaction before marking the job complete.
+- STRONG consistency: `Invoice`/`Subscription`/`Refund` status updates —
+  synchronous within the worker's transaction before marking the job
+  complete.
 - EVENTUAL consistency: analytics (MRR, active subscriptions, 30-day churn,
-  lifetime revenue) — separate read model `MaterializedRevenueStats`, one
-  row per `(userId, currency)`. ADR-002. How it stays current:
+  lifetime revenue net of refunds, total refunds) — separate read model
+  `MaterializedRevenueStats`, one row per `(userId, currency)`. ADR-002.
+  How it stays current:
   - `handle-webhook-event.ts` enqueues a `recompute` job on the
     `revenue-stats` queue after every event whose registry entry has
     `affectsRevenue: true` (at-least-once: also on a re-run of an
@@ -300,7 +338,7 @@ can't enforce uniqueness without the partition key (ADR-007).
   `src/lib/subscription-state.test.ts` (ordering rule, Stripe → our status
   mapping, both API payload shapes), `src/lib/rate-limit.test.ts`,
   `src/lib/logger.test.ts`, `src/lib/email.test.ts`,
-  `checkout-session.test.ts`.
+  `src/lib/refund-state.test.ts`, `checkout-session.test.ts`.
 - `npm run test:integration` — needs `docker compose up -d postgres redis`.
   Real Postgres because the guarantees under test live in SQL (conditional
   UPDATEs, row locks, the advisory lock, the stats aggregation); real Redis
@@ -321,7 +359,17 @@ can't enforce uniqueness without the partition key (ADR-007).
   invalidation and Redis-down fallbacks, the token bucket, the endpoint
   with Redis down or hanging, the relay's four cases, failure recording
   and replay, the admin page (rendering, escaping, cross-site refusal),
-  and notifications (what is sent, to whom, exactly once).
+  notifications (what is sent, to whom, exactly once), and refunds
+  (`refund-requests.test.ts`: concurrent / double / over-refunds, Stripe
+  rejection vs no answer + retry, payment-intent lookups;
+  `refund-events.test.ts`: order, duplicates, concurrency, reversal,
+  Dashboard refunds, tenant isolation, net revenue, the failed-refund
+  email).
+- Races that a missing lock would lose only sometimes are made
+  deterministic with `holdRowLock()` + `waitForLockWaiters()`
+  (`test/db.ts`): the test holds the row lock and queues the competing
+  transactions behind it in a known order. Use them for new lock-based
+  guarantees — a plain `Promise.all` race survived removing `FOR UPDATE`.
 - Integration timeouts are raised (`testTimeout` 20s): the first test of a
   file also pays for opening the DB/Redis connections, and under load that
   alone passed the default 5s and failed unrelated tests.
@@ -401,7 +449,7 @@ can't enforce uniqueness without the partition key (ADR-007).
    subscription moved MRR 10.00 → 39.00 and back to 10.00 on cancel with
    lifetime revenue staying put; cache key present with TTL; sixth signup
    from one address answered 429 with `Retry-After`.
-6. ✅ (awaiting review) Reliability and operations: outbox relay + the
+6. ✅ Reliability and operations: outbox relay + the
    endpoint acknowledging once the row is stored (ADR-001 amendment); dead
    letters with `lastError`, replay, and the `/admin/events` page;
    structured logs correlated by `stripeEventId` (ADR-009); email
@@ -414,9 +462,19 @@ can't enforce uniqueness without the partition key (ADR-007).
    "payment received" and "subscription payment failed" notifications
    recorded as `SKIPPED` (no API key locally). Not verified: an email
    actually delivered by Resend.
-7. Refunds and disputes (own phase, agreed 2026-10-12): `charge.refunded` /
-   dispute events → negative `Transaction`s, invoice/subscription
-   consequences, lifetime revenue becoming net, a notification.
+7. ✅ (awaiting review) Refunds (ADR-011; disputes dropped from scope,
+   agreed 2026-10-29): "Refund" on `/dashboard/payments` (full or partial,
+   intent-first, payment row locked for the refundable check, Stripe
+   idempotency key, retry under the same key), `refund.*` events mirrored
+   with a forward-only state graph and an append-only signed ledger,
+   refunds made in the tenant's Stripe Dashboard matched by payment intent,
+   lifetime revenue net of refunds + `totalRefunds`, "refund failed"
+   email. 272 tests (110 unit + 162 integration); 10 guarantees checked by
+   removing them — that check found a lost-update race in the worker
+   (fixed: lock the refund row before reading its status) and a
+   concurrency test that couldn't fail (fixed: `holdRowLock`). Not yet
+   verified live against the sandbox: Docker Desktop broke mid-check
+   (C: drive full → overlay I/O errors), before any refund reached Stripe.
 8. Polished README + deploy (Vercel app, Railway/Render worker + Redis)
 
 ## Working style

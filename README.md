@@ -10,7 +10,7 @@ Architecture rationale and phased build plan:
 [`stripe-saas-senior-architecture-plan.md`](./stripe-saas-senior-architecture-plan.md).
 Individual decisions are recorded in [`docs/adr/`](./docs/adr/) as they're made.
 
-**Status: Phase 6 (reliability and operations) complete.**
+**Status: Phase 7 (refunds) complete.**
 - Phase 0 — infra: Docker Compose, Prisma schema, BullMQ, Bull Board.
 - Phase 1 — auth + Stripe Connect onboarding.
 - Phase 2 — webhook pipeline: signature verification, idempotent outbox
@@ -28,8 +28,11 @@ Individual decisions are recorded in [`docs/adr/`](./docs/adr/) as they're made.
   through a Redis outage), dead letters with a reason and a replay button,
   structured logs correlated by Stripe event id (ADR-009), and email
   notifications sent at most once (ADR-010).
+- Phase 7 — refunds, full or partial, requested from PayFlow or made in
+  the tenant's Stripe Dashboard, mirrored from Stripe's refund events into
+  an append-only ledger; lifetime revenue becomes net of refunds (ADR-011).
 
-Next: refunds and disputes, then deployment.
+Next: deployment. Disputes are out of scope for now.
 
 ## Architecture at a glance
 
@@ -41,7 +44,7 @@ Next.js app  ──┐
 
 Worker (separate Node.js process)
   ├─ BullMQ Worker: `webhook-events`  — Stripe events → invoices,
-  │                                      subscriptions, transactions
+  │                                      subscriptions, refunds, transactions
   ├─ BullMQ Worker: `revenue-stats`   — recomputes each tenant's revenue
   │                                      read model after those change
   ├─ BullMQ Worker: `notifications`   — emails the tenant (Resend)
@@ -132,11 +135,17 @@ npm run worker:dev           # in a second terminal — BullMQ worker + Bull Boa
    status, renewals and cancellation mirror Stripe's lifecycle events.
    "Cancel" asks Stripe to cancel — the row shows `CANCELED` once Stripe's
    webhook confirms it.
-7. Back on `/dashboard`, the **Revenue** panel shows MRR, active
-   subscriptions, 30-day churn and lifetime revenue, per currency. These
-   come from a read model the worker recomputes in the background, so they
-   can trail the lists by a few seconds — the panel says when they were
-   computed.
+7. `/dashboard/payments` — every payment received (invoice or
+   subscription), with its refunds. "Refund" takes any amount up to what
+   is left to refund, and sends it to Stripe on your account; the refund
+   shows `SUCCEEDED` once Stripe's webhook confirms it, not when the button
+   returns. Refunds you make in your own Stripe Dashboard appear here too,
+   marked "made in Stripe" ([ADR-011](./docs/adr/011-refunds.md)).
+8. Back on `/dashboard`, the **Revenue** panel shows MRR, active
+   subscriptions, 30-day churn, lifetime revenue (net of refunds) and
+   refunds, per currency. These come from a read model the worker
+   recomputes in the background, so they can trail the lists by a few
+   seconds — the panel says when they were computed.
 
 Dashboard actions are rate-limited per tenant (a burst of 20, then one
 every two seconds), and login and signup per client address; going over
@@ -194,7 +203,8 @@ worker handles (`src/worker/processors/index.ts`): `account.updated`,
 `checkout.session.async_payment_succeeded`,
 `checkout.session.async_payment_failed`, `checkout.session.expired`,
 `customer.subscription.created`, `customer.subscription.updated`,
-`customer.subscription.deleted`, `invoice.paid`, `invoice.payment_failed`.
+`customer.subscription.deleted`, `invoice.paid`, `invoice.payment_failed`,
+`refund.created`, `refund.updated`, `refund.failed`.
 
 ### End-to-end: connect, invoice, pay
 
@@ -239,6 +249,21 @@ Resending the subscription's `invoice.paid` event
 (`stripe events resend <evt_id> --account <acct_id>`) is a duplicate
 delivery and must *not* add a second `Transaction`.
 
+### End-to-end: refund
+
+1. Pay an invoice (above), then on `/dashboard/payments` refund part of
+   it, e.g. `5.00` of `20.00`. The page says the refund was sent; within a
+   moment it reads `−5.00 USD SUCCEEDED · from PayFlow`, the form offers
+   the remaining `15.00`, and the Revenue panel's lifetime figure drops by
+   5.00 with 5.00 under Refunds.
+2. In the Stripe Dashboard (the connected account), refund another part of
+   the same payment. It appears under the payment as "made in Stripe".
+3. A refund that fails: pay an invoice with card `4000 0000 0000 5126`
+   and refund it. Stripe first reports it `succeeded`, then `failed` —
+   the refund ends `FAILED` with Stripe's reason, the ledger keeps the
+   debit plus a reversal (lifetime revenue goes back up), and the tenant
+   gets one "Refund failed" notification (`SKIPPED` without an API key).
+
 To fire a Connect-scoped test event without a real checkout:
 `stripe trigger --stripe-account acct_... checkout.session.completed`. It
 reaches the worker and no-ops (`no Invoice for session ...`) — that session
@@ -280,9 +305,9 @@ The last one cannot be processed and becomes a **dead letter**.
 
   returns its receipt, its processing, the stats recompute it caused and
   the notification about it.
-- **Emails.** A paid invoice or subscription, and a failed subscription
-  payment, notify the tenant by email, at most once per payment
-  ([ADR-010](./docs/adr/010-email-notifications.md)). Without a
+- **Emails.** A paid invoice or subscription, a failed subscription
+  payment and a failed refund notify the tenant by email, at most once per
+  payment or refund ([ADR-010](./docs/adr/010-email-notifications.md)). Without a
   `RESEND_API_KEY` nothing is sent: the notification is recorded as
   `SKIPPED` and logged.
 
@@ -303,7 +328,8 @@ environment variables, and that step keeps it possible
 The **unit tests** cover the rules that are pure functions: the
 subscription ordering decision, the mapping from Stripe's objects to ours
 (in both API payload shapes), amount parsing and platform-fee rounding,
-which Checkout event means what for an invoice, the logger's context
+which Checkout event means what for an invoice, the refund state graph
+(forward only, no cycles) and the refundable amount, the logger's context
 propagation, and the email client's request and error classification.
 
 The **integration tests** need `docker compose up -d postgres redis`. They
@@ -341,6 +367,21 @@ sending, the email provider. What they pin down:
   cache TTL; with Redis unreachable it reads Postgres instead
 - the token bucket: burst, refill, cap, no token spent twice under
   concurrency, and requests allowed when Redis is unreachable
+- refunds: two full refunds requested at the same moment refund once, a
+  double submit refunds once, partial refunds stop at the amount paid; a
+  refund Stripe rejects frees its amount, one Stripe never answered keeps
+  it and is retried under the same idempotency key
+- refund events in any order, duplicated or concurrent, end in Stripe's
+  final state with one debit — and a reversal when a refund fails after
+  succeeding, even when the two events are processed at the same moment
+- refunds made in the Stripe Dashboard are matched to their payment
+  through Stripe; another tenant's metadata can't claim a refund; revenue
+  is net of refunds; a failed refund is emailed once, though two events
+  report it
+
+Races are made deterministic where it matters: the test holds the row
+lock itself and lines the competing transactions up behind it, so the
+interleaving that breaks a missing lock happens on every run.
 
 Each of these was checked the other way round too: remove the guarantee
 from the code, and the corresponding test fails.
