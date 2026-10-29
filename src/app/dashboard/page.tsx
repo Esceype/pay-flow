@@ -124,7 +124,8 @@ export default async function DashboardPage({
                   <th className="py-2 font-medium">MRR</th>
                   <th className="py-2 font-medium">Active subscriptions</th>
                   <th className="py-2 font-medium">Churn (30 days)</th>
-                  <th className="py-2 font-medium">Total revenue</th>
+                  <th className="py-2 font-medium">Total revenue (net)</th>
+                  <th className="py-2 font-medium">Refunds</th>
                 </tr>
               </thead>
               <tbody>
@@ -134,6 +135,7 @@ export default async function DashboardPage({
                     <td className="py-2">{stats.activeSubscriptions}</td>
                     <td className="py-2">{(stats.churnRate * 100).toFixed(1)}%</td>
                     <td className="py-2">{formatMoney(stats.totalRevenue, stats.currency)}</td>
+                    <td className="py-2">{formatMoney(stats.totalRefunds, stats.currency)}</td>
                   </tr>
                 ))}
               </tbody>

@@ -12,7 +12,11 @@ import { subscriptionRefOfInvoice } from "../lib/subscription-state";
 // to delay or fail the recording of a payment.
 
 export interface NotificationDraft {
-  kind: "payment_received" | "subscription_payment_failed";
+  kind: "payment_received" | "subscription_payment_failed" | "refund_failed";
+  // What makes two notifications the same one. Usually the event that
+  // caused it; for a refund, the refund itself — two different events can
+  // both report the same refund failing, and that is one email.
+  dedupeKey: string;
   userId: string;
   recipient: string;
   subject: string;
@@ -30,6 +34,9 @@ export async function buildNotification(
 ): Promise<NotificationDraft | null> {
   if (webhookEvent.type === "invoice.payment_failed") {
     return paymentFailed(webhookEvent);
+  }
+  if (webhookEvent.type.startsWith("refund.")) {
+    return refundFailed(webhookEvent);
   }
   return paymentReceived(webhookEvent);
 }
@@ -56,6 +63,7 @@ async function paymentReceived(webhookEvent: WebhookEvent): Promise<Notification
 
   return {
     kind: "payment_received",
+    dedupeKey: `payment_received:${webhookEvent.stripeEventId}`,
     userId: transaction.userId,
     recipient: transaction.user.email,
     subject: `Payment received: ${amount} from ${customer}`,
@@ -96,6 +104,7 @@ async function paymentFailed(webhookEvent: WebhookEvent): Promise<NotificationDr
 
   return {
     kind: "subscription_payment_failed",
+    dedupeKey: `subscription_payment_failed:${webhookEvent.stripeEventId}`,
     userId: subscription.userId,
     recipient: subscription.user.email,
     subject: `Payment failed: ${amount} from ${subscription.customer.email}`,
@@ -111,10 +120,54 @@ async function paymentFailed(webhookEvent: WebhookEvent): Promise<NotificationDr
   };
 }
 
+// Only a refund that ended up FAILED is news: the tenant asked for (or made)
+// the refund, so success is expected, but a failure means the customer
+// didn't get their money back and someone has to act. Read from our row,
+// not the event, so it is whatever the refund's status is now.
+async function refundFailed(webhookEvent: WebhookEvent): Promise<NotificationDraft | null> {
+  const event = webhookEvent.payload as unknown as Stripe.RefundFailedEvent;
+  const refund = await prisma.refund.findUnique({
+    where: { stripeRefundId: event.data.object.id },
+    include: {
+      user: { select: { email: true } },
+      payment: {
+        select: {
+          invoice: { select: { customer: { select: { email: true } } } },
+          subscription: { select: { customer: { select: { email: true } } } },
+        },
+      },
+    },
+  });
+  if (!refund || refund.userId !== webhookEvent.userId || refund.status !== "FAILED") return null;
+
+  const amount = formatMoney(refund.amount, refund.currency);
+  const customer =
+    refund.payment.invoice?.customer.email ??
+    refund.payment.subscription?.customer.email ??
+    "a customer";
+
+  return {
+    kind: "refund_failed",
+    dedupeKey: `refund_failed:${event.data.object.id}`,
+    userId: refund.userId,
+    recipient: refund.user.email,
+    subject: `Refund failed: ${amount} to ${customer}`,
+    text: [
+      `A refund of ${amount} to ${customer} failed` +
+        (refund.failureReason ? ` (${refund.failureReason}).` : "."),
+      "",
+      "The customer has not received this money; it remains in your Stripe balance.",
+      "You can try another refund from the Payments page on your PayFlow dashboard.",
+      "",
+      "— PayFlow",
+    ].join("\n"),
+  };
+}
+
 // The job. Two guards keep a tenant from getting the same email twice
 // however often this runs for one event:
 //
-//   1. The Notification row, unique on kind + event id, is written before
+//   1. The Notification row, unique on its dedupeKey, is written before
 //      sending and marked SENT after. A re-run finds it already SENT.
 //   2. The same key is the provider's idempotency key, which covers the gap
 //      guard 1 can't: a crash after the provider accepted the email but
@@ -138,7 +191,7 @@ export async function handleNotificationJob(webhookEventId: string): Promise<voi
       const draft = await buildNotification(webhookEvent);
       if (!draft) return;
 
-      const dedupeKey = `${draft.kind}:${webhookEvent.stripeEventId}`;
+      const { dedupeKey } = draft;
       const notification = await recordNotification(draft, dedupeKey);
       if (notification.status !== "PENDING") return;
 

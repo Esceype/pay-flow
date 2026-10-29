@@ -23,6 +23,7 @@ interface StatsRow {
   activeSubscriptions: number;
   churnRate: number;
   totalRevenue: bigint;
+  totalRefunds: bigint;
 }
 
 // One recompute per tenant at a time, across every worker process: a
@@ -81,7 +82,14 @@ export async function recomputeRevenueStats(userId: string, now: Date = new Date
           GROUP BY currency
         ),
         revenue AS (
-          SELECT currency, SUM(amount)::bigint AS total
+          -- The ledger is append-only and signed: payments positive, a
+          -- refund's debit negative, its reversal positive again (ADR-011).
+          -- So the plain sum is net revenue, and the refund rows alone are
+          -- what has been given back.
+          SELECT
+            currency,
+            SUM(amount)::bigint AS total,
+            (-COALESCE(SUM(amount) FILTER (WHERE "refundId" IS NOT NULL), 0))::bigint AS refunds
           FROM "Transaction"
           WHERE "userId" = ${userId}
           GROUP BY currency
@@ -94,7 +102,8 @@ export async function recomputeRevenueStats(userId: string, now: Date = new Date
             WHEN COALESCE(subs.running_at_window_start, 0) = 0 THEN 0
             ELSE subs.churned::float8 / subs.running_at_window_start
           END AS "churnRate",
-          COALESCE(revenue.total, 0)::bigint AS "totalRevenue"
+          COALESCE(revenue.total, 0)::bigint AS "totalRevenue",
+          COALESCE(revenue.refunds, 0)::bigint AS "totalRefunds"
         FROM subs
         FULL OUTER JOIN revenue ON revenue.currency = subs.currency
       `;
@@ -105,6 +114,7 @@ export async function recomputeRevenueStats(userId: string, now: Date = new Date
           activeSubscriptions: row.activeSubscriptions,
           churnRate: row.churnRate,
           totalRevenue: row.totalRevenue,
+          totalRefunds: row.totalRefunds,
           computedAt: now,
         };
         await tx.materializedRevenueStats.upsert({

@@ -16,7 +16,8 @@ export interface CurrencyRevenueStats {
   mrr: number; // cents per month
   activeSubscriptions: number;
   churnRate: number; // 0..1, last 30 days
-  totalRevenue: number; // cents, lifetime
+  totalRevenue: number; // cents, lifetime, net of refunds
+  totalRefunds: number; // cents, lifetime, positive
 }
 
 export interface RevenueStats {
@@ -56,6 +57,7 @@ export async function getRevenueStats(userId: string): Promise<RevenueStats> {
       // BigInt in the database; a JS number holds cents exactly up to about
       // 90 trillion in currency units, and JSON can't carry a bigint.
       totalRevenue: Number(row.totalRevenue),
+      totalRefunds: Number(row.totalRefunds),
     })),
     // All of a tenant's rows are written by the same recompute.
     computedAt: rows[0]?.computedAt.toISOString() ?? null,

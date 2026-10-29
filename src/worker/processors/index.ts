@@ -1,6 +1,7 @@
 import type { WebhookEvent } from "@prisma/client";
 import { processAccountDeauthorized, processAccountUpdated } from "./account";
 import { processCheckoutSessionEvent } from "./checkout-session";
+import { processRefundEvent } from "./refund";
 import { processSubscriptionEvent, processSubscriptionInvoicePaid } from "./subscription";
 
 type Processor = (webhookEvent: WebhookEvent) => Promise<void>;
@@ -52,6 +53,12 @@ const registrations: Partial<Record<string, Registration>> = {
   // Nothing to write — the subscription's PAST_DUE arrives as
   // customer.subscription.updated — but it is what the tenant is told about.
   "invoice.payment_failed": { notifies: true },
+  // Refunds, from PayFlow or from the tenant's Stripe Dashboard (ADR-011).
+  // A refund that succeeds or fails moves money in the ledger; one that
+  // fails is also worth an email.
+  "refund.created": { process: processRefundEvent, affectsRevenue: true, notifies: true },
+  "refund.updated": { process: processRefundEvent, affectsRevenue: true, notifies: true },
+  "refund.failed": { process: processRefundEvent, affectsRevenue: true, notifies: true },
 };
 
 export function getRegistration(eventType: string): Registration | undefined {

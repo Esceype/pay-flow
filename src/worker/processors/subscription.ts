@@ -226,6 +226,9 @@ export async function processSubscriptionInvoicePaid(webhookEvent: WebhookEvent)
         userId: subscription.userId,
         subscriptionId: subscription.id,
         stripeEventId: webhookEvent.stripeEventId,
+        // Needed to refund it later: the invoice is how the payment intent
+        // behind a subscription payment is found (ADR-011).
+        stripeInvoiceId: invoice.id,
         type: event.type,
         amount: invoice.amount_paid,
         currency: invoice.currency,
